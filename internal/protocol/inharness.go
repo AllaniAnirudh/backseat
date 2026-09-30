@@ -76,8 +76,10 @@ const (
 // path answers a different question: no PTY answer bytes are written, the
 // decision is an enum string, DecidedBy names the decider, and the request
 // TTL travels with the decision so the MCP server can reject stale
-// answers. The two types are not interchangeable; the MCP server bridges
-// between them when a session mixes PTY and in-harness clients.
+// answers. The two types are not interchangeable; both hosts bridge
+// between them so a session can mix PTY and in-harness clients: mcphost
+// maps approval_response (Approved bool) into its approve/deny resolve
+// path, and the PTY host maps approval_decision onto the PTY answer bytes.
 type ApprovalDecision struct {
 	SessionID  string `json:"session_id"`
 	ApprovalID string `json:"approval_id"`

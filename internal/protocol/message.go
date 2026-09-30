@@ -63,8 +63,10 @@ func (m Message) Decode(v any) error {
 }
 
 // SessionAnnounce is sent by the host when a session goes live.
-// SecretHash is hex(SHA-256(secret)): the relay gates room joins on it
-// without ever seeing the secret itself.
+// SecretHash is hex(SHA-256(secret)): published so clients can confirm
+// they hold the same invite. The relay does not gate room joins on it;
+// experts join on session freshness and the host verifies the secret
+// through the HMAC enrollment (pairing_enroll) before any content flows.
 type SessionAnnounce struct {
 	SessionID  string `json:"session_id"`
 	HostName   string `json:"host_name"`

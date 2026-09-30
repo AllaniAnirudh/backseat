@@ -69,6 +69,9 @@ func Dial(cfg Config) (*Link, error) {
 	if err != nil {
 		return nil, fmt.Errorf("link: dial relay: %w", err)
 	}
+	// Cap inbound envelope size: a malicious relay (or peer) cannot make
+	// the host buffer unbounded data.
+	conn.SetReadLimit(1 << 20) // 1 MiB
 	return &Link{
 		cfg:        cfg,
 		conn:       conn,
