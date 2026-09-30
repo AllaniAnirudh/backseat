@@ -329,10 +329,11 @@ button:disabled { background: #30363d; cursor: default; }
     }
     else if (msg.type === 'exec_output' && inHarness) renderExecOutput(p);
     else if (msg.type === 'checkpoint_event') {
-      term.writeln('');
-      term.writeln('[checkpoint] ' + (p.action || '') +
+      var cmsg = '[checkpoint] ' + (p.action || '') +
         (p.label ? ' "' + p.label + '"' : '') +
-        (p.message ? ': ' + p.message : ''));
+        (p.message ? ': ' + p.message : '');
+      if (inHarness) addTranscript('tk-sys', cmsg);
+      else { term.writeln(''); term.writeln(cmsg); }
     }
   }
 
