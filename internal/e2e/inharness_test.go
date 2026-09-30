@@ -157,11 +157,15 @@ func TestInHarnessFlow(t *testing.T) {
 		t.Fatalf("bad exec output: %+v", eout)
 	}
 	sawExecInbox := false
-	for _, it := range sess.Poll() {
-		if it.Type == "exec" {
-			sawExecInbox = true
+	waitFor(t, 5*time.Second, func() bool {
+		for _, it := range sess.Poll() {
+			if it.Type == "exec" {
+				sawExecInbox = true
+				return true
+			}
 		}
-	}
+		return false
+	}, "exec inbox report")
 	if !sawExecInbox {
 		t.Fatal("exec run was not reported to the agent inbox (not novice-visible)")
 	}

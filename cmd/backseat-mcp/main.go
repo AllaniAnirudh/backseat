@@ -30,7 +30,8 @@
 //	BACKSEAT_HOST_NAME   display name shown to the expert (default: agent)
 //	BACKSEAT_CTL_SOCK    control socket path (default: $TMPDIR/backseat-mcp-<32 random hex>.sock)
 //	BACKSEAT_ASSUME_YES  "1" answers the human-confirm prompts with yes (trusts
-//	                     the local console user; for tests/headless)
+//	                     whoever set the launch env; for tests/headless only,
+//	                     never in agent-writable config)
 package main
 
 import (
@@ -65,8 +66,11 @@ const humanConfirmTimeout = 60 * time.Second
 // answer; only the human at the console can. It fails closed: no TTY, a
 // denied answer, or a timeout all refuse.
 //
-// BACKSEAT_ASSUME_YES=1 bypasses the prompt. It trusts whoever launched
-// the server (the local console user); meant for tests and headless runs.
+// BACKSEAT_ASSUME_YES=1 bypasses the prompt. It trusts whoever controls the
+// server's launch environment (the human's harness config, normally) to have
+// set it deliberately; meant for tests and headless runs. Never put it in a
+// config the agent itself can write: the agent could then mint sessions and
+// confirm grants without the human.
 func humanConfirmTTY(prompt string) (bool, error) {
 	if os.Getenv("BACKSEAT_ASSUME_YES") == "1" {
 		return true, nil
@@ -308,6 +312,11 @@ func handleEndSession(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallTo
 }
 
 func runMCPServer() error {
+	if os.Getenv("BACKSEAT_ASSUME_YES") == "1" {
+		fmt.Fprintln(os.Stderr, "backseat: WARNING: BACKSEAT_ASSUME_YES=1 is set: human confirmation prompts are DISABLED. "+
+			"Only set this for trusted automation or tests; never in a config the agent can write, "+
+			"or a prompt-injected agent could create sessions and approve grants on its own.")
+	}
 	srv := server.NewMCPServer("backseat", "0.3.0")
 
 	srv.AddTool(mcp.NewTool("backseat__create_session",
