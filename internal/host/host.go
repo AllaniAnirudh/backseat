@@ -11,19 +11,15 @@
 package host
 
 import (
-	"crypto/rand"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
-	"github.com/gorilla/websocket"
-
+	"github.com/AllaniAnirudh/backseat/internal/link"
 	"github.com/AllaniAnirudh/backseat/internal/pairing"
 	"github.com/AllaniAnirudh/backseat/internal/protocol"
 	bpty "github.com/AllaniAnirudh/backseat/internal/pty"
@@ -52,19 +48,14 @@ type Config struct {
 // Host runs one live session.
 type Host struct {
 	cfg  Config
-	conn *websocket.Conn
+	link *link.Link
 	sess *bpty.Session
 
-	writeMu sync.Mutex
-	mu      sync.Mutex
+	mu sync.Mutex
 	// controller is "" when the host holds control, else the expert name.
 	controller string
 	// pending is the expert name awaiting a grant/deny decision.
 	pending string
-	// pendingChallenges holds the in-flight HMAC challenge per joining expert.
-	pendingChallenges map[string][pairing.SecretLen]byte
-	// enrolled holds the derived directional keys per enrolled expert.
-	enrolled map[string]pairing.Keys
 	// announce is the session description, sent plaintext to the relay and
 	// encrypted to each expert after enrollment.
 	announce protocol.SessionAnnounce
@@ -82,7 +73,6 @@ type Host struct {
 	// confirmation. Nil when none is outstanding.
 	pendingRestore *pendingRestoreReq
 
-	idSeq      atomic.Int64
 	shutOnce   sync.Once
 	endOnce    sync.Once
 	wg         sync.WaitGroup
@@ -94,12 +84,6 @@ type pendingRestoreReq struct {
 	expert    string
 	label     string
 	requested time.Time
-}
-
-func newID() string {
-	b := make([]byte, 8)
-	rand.Read(b)
-	return hex.EncodeToString(b)
 }
 
 // New starts the agent in a PTY, dials the relay, and announces the session.
@@ -114,10 +98,15 @@ func New(cfg Config) (*Host, error) {
 	if err != nil {
 		return nil, fmt.Errorf("host: pty: %w", err)
 	}
-	conn, _, err := websocket.DefaultDialer.Dial(cfg.RelayURL, nil)
+	rl, err := link.Dial(link.Config{
+		RelayURL:  cfg.RelayURL,
+		SessionID: cfg.SessionID,
+		HostName:  cfg.HostName,
+		Secret:    cfg.Secret,
+	})
 	if err != nil {
 		sess.Close()
-		return nil, fmt.Errorf("host: dial relay: %w", err)
+		return nil, err
 	}
 	announce := protocol.SessionAnnounce{
 		SessionID:  cfg.SessionID,
@@ -128,25 +117,23 @@ func New(cfg Config) (*Host, error) {
 		ExpiresAt:  time.Now().Add(pairing.InviteTTL).Unix(),
 	}
 	h := &Host{
-		cfg:               cfg,
-		conn:              conn,
-		sess:              sess,
-		pendingChallenges: make(map[string][pairing.SecretLen]byte),
-		enrolled:          make(map[string]pairing.Keys),
-		approvals:         make(map[string]*pendingApproval),
-		announce:          announce,
-		terminated:        make(chan struct{}),
+		cfg:        cfg,
+		link:       rl,
+		sess:       sess,
+		approvals:  make(map[string]*pendingApproval),
+		announce:   announce,
+		terminated: make(chan struct{}),
 	}
 	cpm, err := NewCheckpointManager(cfg.WorkDir)
 	if err != nil {
 		sess.Close()
-		conn.Close()
+		rl.Close()
 		return nil, fmt.Errorf("host: checkpoints: %w", err)
 	}
 	h.checkpoints = cpm
-	if err := h.send(protocol.TypeSessionAnnounce, announce); err != nil {
+	if err := h.link.SendPlain(protocol.TypeSessionAnnounce, announce, ""); err != nil {
 		sess.Close()
-		conn.Close()
+		rl.Close()
 		return nil, fmt.Errorf("host: announce: %w", err)
 	}
 	h.wg.Add(3)
@@ -160,74 +147,6 @@ func (h *Host) event(s string) {
 	if h.cfg.OnEvent != nil {
 		h.cfg.OnEvent(s)
 	}
-}
-
-// send writes a plaintext envelope (relay-readable control types only:
-// session_announce, pairing_enroll, peer_kick, session_end).
-func (h *Host) send(msgType string, payload any) error {
-	return h.sendRouted(msgType, payload, "")
-}
-
-// sendRouted writes a plaintext envelope addressed to one expert.
-func (h *Host) sendRouted(msgType string, payload any, to string) error {
-	h.idSeq.Add(1)
-	msg, err := protocol.New(msgType, newID(), time.Now().UnixMilli(), payload)
-	if err != nil {
-		return err
-	}
-	msg.To = to
-	msg.From = h.cfg.HostName
-	h.writeMu.Lock()
-	defer h.writeMu.Unlock()
-	return h.conn.WriteJSON(msg)
-}
-
-// sendTo encrypts the payload with the expert's HostToExpert key and routes
-// it to them. It fails if the expert has not completed enrollment.
-func (h *Host) sendTo(expert, msgType string, payload any) error {
-	h.mu.Lock()
-	ks, ok := h.enrolled[expert]
-	h.mu.Unlock()
-	if !ok {
-		return fmt.Errorf("host: expert %q not enrolled", expert)
-	}
-	raw, err := json.Marshal(payload)
-	if err != nil {
-		return err
-	}
-	env, err := pairing.Seal(ks.HostToExpert, raw)
-	if err != nil {
-		return err
-	}
-	h.idSeq.Add(1)
-	msg := protocol.Message{
-		Type:      msgType,
-		ID:        newID(),
-		Timestamp: time.Now().UnixMilli(),
-		To:        expert,
-		From:      h.cfg.HostName,
-		Payload:   env,
-	}
-	h.writeMu.Lock()
-	defer h.writeMu.Unlock()
-	return h.conn.WriteJSON(msg)
-}
-
-// decryptFrom opens an expert's envelope with their ExpertToHost key. A
-// failed open — wrong key, tampered bytes, or a spoofed From — drops the
-// message.
-func (h *Host) decryptFrom(from string, payload json.RawMessage) ([]byte, bool) {
-	h.mu.Lock()
-	ks, ok := h.enrolled[from]
-	h.mu.Unlock()
-	if !ok {
-		return nil, false
-	}
-	raw, err := pairing.Open(ks.ExpertToHost, payload)
-	if err != nil {
-		return nil, false
-	}
-	return raw, true
 }
 
 // pumpOutput streams PTY output to the relay and the local mirror. Each
@@ -246,13 +165,9 @@ func (h *Host) pumpOutput() {
 		}
 		h.mu.Lock()
 		h.outputBytes += int64(len(b))
-		names := make([]string, 0, len(h.enrolled))
-		for n := range h.enrolled {
-			names = append(names, n)
-		}
 		h.mu.Unlock()
-		for _, n := range names {
-			_ = h.sendTo(n, protocol.TypeTermOutput, protocol.TermOutput{
+		for _, n := range h.link.EnrolledNames() {
+			_ = h.link.SendTo(n, protocol.TypeTermOutput, protocol.TermOutput{
 				SessionID: h.cfg.SessionID,
 				Data:      base64.StdEncoding.EncodeToString(b),
 			})
@@ -290,10 +205,7 @@ func (h *Host) scanApprovals(b []byte) {
 			delete(h.approvals, id)
 		}
 	}
-	var allEnrolled []string
-	for n := range h.enrolled {
-		allEnrolled = append(allEnrolled, n)
-	}
+	allEnrolled := h.link.EnrolledNames()
 	if match == nil {
 		h.mu.Unlock()
 		for _, p := range cancelled {
@@ -346,7 +258,7 @@ func (h *Host) scanApprovals(b []byte) {
 		ExpiresAt:    appr.createdAt.Add(approvalTTL).Unix(),
 	}
 	for _, n := range recipients {
-		_ = h.sendTo(n, protocol.TypeApprovalRequest, req)
+		_ = h.link.SendTo(n, protocol.TypeApprovalRequest, req)
 	}
 	h.event(fmt.Sprintf("approval prompt forwarded to %s: %q", strings.Join(recipients, ","), match.Prompt))
 }
@@ -361,7 +273,7 @@ func (h *Host) dismissApproval(id string, recipients []string, reason string) {
 		Broadcast:  true,
 	}
 	for _, n := range recipients {
-		_ = h.sendTo(n, protocol.TypeApprovalResponse, ev)
+		_ = h.link.SendTo(n, protocol.TypeApprovalResponse, ev)
 	}
 	h.event(fmt.Sprintf("approval %s dismissed: %s", id, reason))
 }
@@ -386,10 +298,7 @@ func (h *Host) sweepApprovals() {
 					delete(h.approvals, id)
 				}
 			}
-			var allEnrolled []string
-			for n := range h.enrolled {
-				allEnrolled = append(allEnrolled, n)
-			}
+			allEnrolled := h.link.EnrolledNames()
 			if h.pendingRestore != nil && now.Sub(h.pendingRestore.requested) > restoreConfirmTTL {
 				pr := h.pendingRestore
 				h.pendingRestore = nil
@@ -410,8 +319,8 @@ func (h *Host) sweepApprovals() {
 func (h *Host) readLoop() {
 	defer h.wg.Done()
 	for {
-		var msg protocol.Message
-		if err := h.conn.ReadJSON(&msg); err != nil {
+		msg, err := h.link.Read()
+		if err != nil {
 			h.shutdown()
 			return
 		}
@@ -431,7 +340,7 @@ func (h *Host) readLoop() {
 				h.onEnrollResponse(msg.From, pe)
 			}
 		case protocol.TypeControlRequest:
-			raw, ok := h.decryptFrom(msg.From, msg.Payload)
+			raw, ok := h.link.Decrypt(msg.From, msg.Payload)
 			if !ok {
 				continue
 			}
@@ -441,7 +350,7 @@ func (h *Host) readLoop() {
 			}
 			h.onRequest(req)
 		case protocol.TypeControlYield:
-			raw, ok := h.decryptFrom(msg.From, msg.Payload)
+			raw, ok := h.link.Decrypt(msg.From, msg.Payload)
 			if !ok {
 				continue
 			}
@@ -477,19 +386,11 @@ func (h *Host) readLoop() {
 // onJoin starts the HMAC enrollment for a newcomer: a fresh challenge goes
 // out as plaintext phase 1, routed to them by name.
 func (h *Host) onJoin(name string) {
-	ch, err := pairing.NewChallenge()
-	if err != nil {
+	if err := h.link.BeginEnrollment(name); err != nil {
+		h.event(fmt.Sprintf("enrollment challenge for %s failed: %v", name, err))
 		return
 	}
-	h.mu.Lock()
-	h.pendingChallenges[name] = ch
-	h.mu.Unlock()
 	h.event(fmt.Sprintf("%s joined, enrolling…", name))
-	_ = h.sendRouted(protocol.TypePairingEnroll, protocol.PairingEnroll{
-		SessionID: h.cfg.SessionID,
-		Phase:     1,
-		Challenge: base64.StdEncoding.EncodeToString(ch[:]),
-	}, name)
 }
 
 // onEnrollResponse verifies the phase 2 HMAC. Success derives the
@@ -497,41 +398,19 @@ func (h *Host) onJoin(name string) {
 // session announcement encrypted for that expert. Failure kicks the peer
 // with a plaintext peer_kick the relay can act on.
 func (h *Host) onEnrollResponse(from string, pe protocol.PairingEnroll) {
-	if from == "" {
+	if from == "" || h.link.Enrolled(from) {
 		return
 	}
-	h.mu.Lock()
-	ch, ok := h.pendingChallenges[from]
-	h.mu.Unlock()
-	if !ok {
+	if err := h.link.FinishEnrollment(from, pe); err != nil {
+		if errors.Is(err, link.ErrNoChallenge) {
+			return // stray phase 2, same as before the refactor
+		}
+		h.failEnroll(from, err.Error())
 		return
 	}
-	raw, err := base64.StdEncoding.DecodeString(pe.Response)
-	if err != nil || len(raw) != pairing.SecretLen {
-		h.failEnroll(from, "bad response encoding")
-		return
-	}
-	var resp [pairing.SecretLen]byte
-	copy(resp[:], raw)
-	if !pairing.VerifyEnrollment(h.cfg.Secret, ch, resp) {
-		h.failEnroll(from, "bad challenge response")
-		return
-	}
-	keys, err := pairing.DeriveKeys(h.cfg.Secret, ch)
-	if err != nil {
-		h.failEnroll(from, "key derivation failed")
-		return
-	}
-	h.mu.Lock()
-	h.enrolled[from] = keys
-	delete(h.pendingChallenges, from)
-	h.mu.Unlock()
 	h.event(fmt.Sprintf("%s enrolled, channel encrypted", from))
-	_ = h.sendRouted(protocol.TypePairingEnroll, protocol.PairingEnroll{
-		SessionID: h.cfg.SessionID,
-		Phase:     3,
-	}, from)
-	_ = h.sendTo(from, protocol.TypeSessionAnnounce, h.announce)
+	_ = h.link.AckEnrollment(from)
+	_ = h.link.SendTo(from, protocol.TypeSessionAnnounce, h.announce)
 	// A prompt may have been detected before anyone enrolled (or while a
 	// different expert held control). Flush pending, unexpired prompts to
 	// the newcomer so a waiting agent question is never silently missed.
@@ -555,7 +434,7 @@ func (h *Host) forwardPendingApprovals(to string) {
 	}
 	h.mu.Unlock()
 	for _, p := range pending {
-		_ = h.sendTo(to, protocol.TypeApprovalRequest, protocol.ApprovalRequest{
+		_ = h.link.SendTo(to, protocol.TypeApprovalRequest, protocol.ApprovalRequest{
 			SessionID:    h.cfg.SessionID,
 			ApprovalID:   p.id,
 			Tool:         p.tool,
@@ -572,21 +451,19 @@ func (h *Host) forwardPendingApprovals(to string) {
 }
 
 func (h *Host) failEnroll(name, reason string) {
-	h.mu.Lock()
-	delete(h.pendingChallenges, name)
-	h.mu.Unlock()
-	_ = h.send(protocol.TypePeerKick, protocol.PeerKick{
+	h.link.Forget(name)
+	_ = h.link.SendPlain(protocol.TypePeerKick, protocol.PeerKick{
 		SessionID:  h.cfg.SessionID,
 		ExpertName: name,
 		Reason:     reason,
-	})
+	}, "")
 	h.event(fmt.Sprintf("enrollment failed for %s: %s", name, reason))
 }
 
 // onInput applies decrypted expert input to the PTY, but only when the
 // sender is the current controller. Anything else is dropped.
 func (h *Host) onInput(msg protocol.Message) {
-	raw, ok := h.decryptFrom(msg.From, msg.Payload)
+	raw, ok := h.link.Decrypt(msg.From, msg.Payload)
 	if !ok {
 		return
 	}
@@ -616,7 +493,7 @@ const restoreConfirmTTL = 60 * time.Second
 // broadcast. Only the controller (or any enrolled expert when nobody
 // holds control) may answer, and only while the prompt is still fresh.
 func (h *Host) onApprovalResponse(msg protocol.Message) {
-	raw, ok := h.decryptFrom(msg.From, msg.Payload)
+	raw, ok := h.link.Decrypt(msg.From, msg.Payload)
 	if !ok {
 		return
 	}
@@ -657,21 +534,16 @@ func (h *Host) onApprovalResponse(msg protocol.Message) {
 		Responder:  from,
 		Broadcast:  true,
 	}
-	h.mu.Lock()
-	var recipients []string
-	for n := range h.enrolled {
-		recipients = append(recipients, n)
-	}
-	h.mu.Unlock()
+	recipients := h.link.EnrolledNames()
 	for _, n := range recipients {
-		_ = h.sendTo(n, protocol.TypeApprovalResponse, bc)
+		_ = h.link.SendTo(n, protocol.TypeApprovalResponse, bc)
 	}
 }
 
 // onCheckpointCreate snapshots the workdir. Experts may only checkpoint
 // while they hold control; the novice always may (via console).
 func (h *Host) onCheckpointCreate(msg protocol.Message) {
-	raw, ok := h.decryptFrom(msg.From, msg.Payload)
+	raw, ok := h.link.Decrypt(msg.From, msg.Payload)
 	if !ok {
 		return
 	}
@@ -683,7 +555,7 @@ func (h *Host) onCheckpointCreate(msg protocol.Message) {
 	controller := h.controller
 	h.mu.Unlock()
 	if controller == "" || msg.From != controller {
-		_ = h.sendTo(msg.From, protocol.TypeCheckpointEvent, protocol.CheckpointEvent{
+		_ = h.link.SendTo(msg.From, protocol.TypeCheckpointEvent, protocol.CheckpointEvent{
 			SessionID: h.cfg.SessionID,
 			Action:    "failed",
 			Label:     cc.Label,
@@ -692,7 +564,7 @@ func (h *Host) onCheckpointCreate(msg protocol.Message) {
 		return
 	}
 	if _, err := h.Checkpoint(cc.Label); err != nil {
-		_ = h.sendTo(msg.From, protocol.TypeCheckpointEvent, protocol.CheckpointEvent{
+		_ = h.link.SendTo(msg.From, protocol.TypeCheckpointEvent, protocol.CheckpointEvent{
 			SessionID: h.cfg.SessionID,
 			Action:    "failed",
 			Label:     cc.Label,
@@ -707,7 +579,7 @@ func (h *Host) onCheckpointCreate(msg protocol.Message) {
 // request is parked until the novice confirms or denies it (or it
 // expires). Only the controller may request.
 func (h *Host) onCheckpointRestore(msg protocol.Message) {
-	raw, ok := h.decryptFrom(msg.From, msg.Payload)
+	raw, ok := h.link.Decrypt(msg.From, msg.Payload)
 	if !ok {
 		return
 	}
@@ -719,7 +591,7 @@ func (h *Host) onCheckpointRestore(msg protocol.Message) {
 	controller := h.controller
 	if controller == "" || msg.From != controller {
 		h.mu.Unlock()
-		_ = h.sendTo(msg.From, protocol.TypeCheckpointEvent, protocol.CheckpointEvent{
+		_ = h.link.SendTo(msg.From, protocol.TypeCheckpointEvent, protocol.CheckpointEvent{
 			SessionID: h.cfg.SessionID,
 			Action:    "failed",
 			Label:     cr.Label,
@@ -729,7 +601,7 @@ func (h *Host) onCheckpointRestore(msg protocol.Message) {
 	}
 	if _, ok := h.checkpoints.Get(cr.Label); !ok {
 		h.mu.Unlock()
-		_ = h.sendTo(msg.From, protocol.TypeCheckpointEvent, protocol.CheckpointEvent{
+		_ = h.link.SendTo(msg.From, protocol.TypeCheckpointEvent, protocol.CheckpointEvent{
 			SessionID: h.cfg.SessionID,
 			Action:    "failed",
 			Label:     cr.Label,
@@ -828,14 +700,9 @@ func (h *Host) broadcastCheckpointEvent(action, label, message string) {
 		Label:     label,
 		Message:   message,
 	}
-	h.mu.Lock()
-	var recipients []string
-	for n := range h.enrolled {
-		recipients = append(recipients, n)
-	}
-	h.mu.Unlock()
+	recipients := h.link.EnrolledNames()
 	for _, n := range recipients {
-		_ = h.sendTo(n, protocol.TypeCheckpointEvent, ev)
+		_ = h.link.SendTo(n, protocol.TypeCheckpointEvent, ev)
 	}
 }
 
@@ -905,7 +772,7 @@ func (h *Host) Grant() error {
 }
 
 func (h *Host) sendGrant(expert string) {
-	_ = h.sendTo(expert, protocol.TypeControlGrant, protocol.ControlGrant{
+	_ = h.link.SendTo(expert, protocol.TypeControlGrant, protocol.ControlGrant{
 		SessionID:  h.cfg.SessionID,
 		ExpertName: expert,
 	})
@@ -927,7 +794,7 @@ func (h *Host) Deny(reason string) error {
 }
 
 func (h *Host) sendDeny(expert, reason string) {
-	_ = h.sendTo(expert, protocol.TypeControlDeny, protocol.ControlDeny{
+	_ = h.link.SendTo(expert, protocol.TypeControlDeny, protocol.ControlDeny{
 		SessionID:  h.cfg.SessionID,
 		ExpertName: expert,
 		Reason:     reason,
@@ -941,7 +808,7 @@ func (h *Host) Yield() {
 	h.controller = ""
 	h.mu.Unlock()
 	if prev != "" {
-		_ = h.sendTo(prev, protocol.TypeControlYield, protocol.ControlYield{
+		_ = h.link.SendTo(prev, protocol.TypeControlYield, protocol.ControlYield{
 			SessionID:  h.cfg.SessionID,
 			ExpertName: prev,
 		})
@@ -956,15 +823,14 @@ func (h *Host) Kick(expert, reason string) {
 	if h.controller == expert {
 		h.controller = ""
 	}
-	delete(h.enrolled, expert)
-	delete(h.pendingChallenges, expert)
 	h.mu.Unlock()
+	h.link.Forget(expert)
 	h.cancelApprovals()
-	_ = h.send(protocol.TypePeerKick, protocol.PeerKick{
+	_ = h.link.SendPlain(protocol.TypePeerKick, protocol.PeerKick{
 		SessionID:  h.cfg.SessionID,
 		ExpertName: expert,
 		Reason:     reason,
-	})
+	}, "")
 	h.event("kicked " + expert)
 }
 
@@ -992,10 +858,7 @@ func (h *Host) Pending() string {
 
 // Enrolled reports whether the named expert completed enrollment.
 func (h *Host) Enrolled(name string) bool {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	_, ok := h.enrolled[name]
-	return ok
+	return h.link.Enrolled(name)
 }
 
 // End terminates the session for everyone and tears down locally.
@@ -1008,10 +871,10 @@ func (h *Host) End(reason string) {
 
 func (h *Host) endWithReason(reason string) {
 	h.endOnce.Do(func() {
-		_ = h.send(protocol.TypeSessionEnd, protocol.SessionEnd{
+		_ = h.link.SendPlain(protocol.TypeSessionEnd, protocol.SessionEnd{
 			SessionID: h.cfg.SessionID,
 			Reason:    reason,
-		})
+		}, "")
 	})
 }
 
@@ -1020,7 +883,7 @@ func (h *Host) endWithReason(reason string) {
 func (h *Host) shutdown() {
 	h.shutOnce.Do(func() {
 		h.sess.Close()
-		h.conn.Close()
+		h.link.Close()
 		close(h.terminated)
 	})
 }
