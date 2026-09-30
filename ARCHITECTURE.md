@@ -83,6 +83,18 @@ Raw terminal sharing already exists (tmate). Backseat earns its place with three
 - **Audit log.** The host records every expert action (control grants, inputs while controlling, approval decisions, checkpoint restores) to a local append-only log for later review. Planned for v0.3.
 - **No private protocol integrations.** Fewer secrets, fewer vendor handshakes, smaller attack surface.
 
+## v0.3: in-harness MCP server (no PTY)
+
+For AI coding agents running inside a harness (the `in-harness` branch), there is a second host that shares the relay and the pairing ceremony but replaces the PTY with a tool API.
+
+**MCP server** (`cmd/backseat-mcp`, `internal/mcphost`). Runs as a stdio MCP server on the novice's machine, one session per process. It exposes exactly seven tools: `backseat__create_session`, `backseat__publish_event`, `backseat__poll`, `backseat__request_approval` (blocking), `backseat__checkpoint`, `backseat__session_status`, `backseat__end_session`. The transport is the shared `internal/link` package (same dial, enrollment, and directional-key code as `internal/host`, refactored so the two hosts cannot drift).
+
+**Control socket** (`backseat-mcp ctl`). There is deliberately no grant tool. Control requests, rewind requests, kick, and end are confirmed by the novice human through `backseat-mcp ctl`, which talks to the session over a unix socket gated by filesystem permissions (same user, never the network). Human confirmation of session creation is enforced by the skill, not the server.
+
+**Exec side channel.** The controller can ask the host to run a shell command (`exec_request` / `exec_output`): controller-only, max two concurrent, killed after 2 minutes, combined stdout/stderr truncated to 64 KB, and every run is mirrored into the novice's inbox so the agent sees what the expert ran. There is no PTY here; the novice agent learns about the expert through `poll()` instead of terminal output.
+
+**Trust model differences from the PTY host.** The MCP server is a trusted endpoint running as the novice's own user, same as `backseat-host`. Session creation is human-gated (the skill asks before calling `create_session`). Outbound text is secret-masked (`internal/mcphost/mask.go`: assignment pairs, known token prefixes, bearer tokens, PEM blocks) on a best-effort heuristic basis. Approval prompts from the agent are forwarded to the expert as one-tap cards and resolve fail-closed (timeout, no expert, or session end all mean denied). Expert rewind requests park for novice confirmation with a 60-second fail-closed TTL, same as the PTY host.
+
 ## MVP demo definition
 
 Run on one machine with two terminals (or two machines on a LAN):
