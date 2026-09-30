@@ -167,6 +167,10 @@ type TermOutput struct {
 }
 
 // TranscriptEvent is a parsed harness event from a transcript adapter.
+// Compat (v0.3): the MCP publish path (backseat__publish_event(type, text,
+// meta)) maps to Kind/Text/Fields directly: Kind carries the event type and
+// Fields carries the meta map. No new field is needed, and the v0.2 JSON
+// encoding is unchanged.
 type TranscriptEvent struct {
 	SessionID string         `json:"session_id"`
 	Harness   string         `json:"harness"`
@@ -179,16 +183,23 @@ type TranscriptEvent struct {
 // stream to the expert. Prompt is the raw prompt text as seen in the
 // terminal; ApproveAnswer/DenyAnswer are the exact bytes the host will
 // write to the PTY for each decision (usually "y\n" / "n\n").
+// Compat (v0.3): the same type name carries the structured in-harness
+// approval from backseat__request_approval. Options and TimeoutSec are
+// additive omitempty fields, so a v0.2-encoded payload decodes identically
+// (new fields stay zero) and a v0.2 decoder ignores the new fields. The
+// PTY-matcher path is kept as fallback.
 type ApprovalRequest struct {
-	SessionID    string `json:"session_id"`
-	ApprovalID   string `json:"approval_id"`
-	Tool         string `json:"tool"`
-	Summary      string `json:"summary"`
-	Command      string `json:"command,omitempty"`
-	Prompt       string `json:"prompt,omitempty"`
-	ApproveLabel string `json:"approve_label,omitempty"` // button text, default "Approve"
-	DenyLabel    string `json:"deny_label,omitempty"`    // button text, default "Deny"
-	ExpiresAt    int64  `json:"expires_at,omitempty"`    // unix seconds
+	SessionID    string   `json:"session_id"`
+	ApprovalID   string   `json:"approval_id"`
+	Tool         string   `json:"tool"`
+	Summary      string   `json:"summary"`
+	Command      string   `json:"command,omitempty"`
+	Prompt       string   `json:"prompt,omitempty"`
+	ApproveLabel string   `json:"approve_label,omitempty"` // button text, default "Approve"
+	DenyLabel    string   `json:"deny_label,omitempty"`    // button text, default "Deny"
+	Options      []string `json:"options,omitempty"`       // in-harness: structured choices beyond approve/deny
+	TimeoutSec   int      `json:"timeout_sec,omitempty"`   // in-harness: 2-min TTL, seconds
+	ExpiresAt    int64    `json:"expires_at,omitempty"`    // unix seconds
 }
 
 // ApprovalResponse carries an approval decision. It travels expert -> host
@@ -219,11 +230,16 @@ type CheckpointRestore struct {
 // Action is one of: created, restored, restore_requested, restore_denied,
 // restore_expired, failed. For restore_requested the novice must confirm
 // via their console before the rewind happens.
+// Compat (v0.3): the design doc calls for a label, a file snapshot id, and
+// a transcript marker. SnapshotID and TranscriptMarker are additive
+// omitempty fields, so v0.2 payloads keep decoding byte-for-byte.
 type CheckpointEvent struct {
-	SessionID string `json:"session_id"`
-	Action    string `json:"action"`
-	Label     string `json:"label,omitempty"`
-	Message   string `json:"message,omitempty"`
+	SessionID        string `json:"session_id"`
+	Action           string `json:"action"`
+	Label            string `json:"label,omitempty"`
+	SnapshotID       string `json:"snapshot_id,omitempty"`       // file snapshot id from backseat__checkpoint
+	TranscriptMarker string `json:"transcript_marker,omitempty"` // marker text for the agent transcript
+	Message          string `json:"message,omitempty"`
 }
 
 // SessionEnd terminates the session and drops all attachments.
