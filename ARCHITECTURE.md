@@ -6,7 +6,7 @@
 
 **Relay server** (`cmd/backseat-relay`, `internal/relay`). Self-hostable WebSocket relay, untrusted by design. Rooms are keyed by session id; the relay forwards JSON envelopes between host and experts, routing by the plaintext `to`/`from` fields. It admits joins while the invite is fresh, marks newcomers pending until the host confirms their HMAC enrollment, and drops peers that never complete it (60s). It keeps no content keys and tracks no control state: only the host decides whose input reaches the PTY.
 
-**Expert client** (`cmd/backseat-expert`). Web UI served over HTTP. Shows the live terminal via xterm.js, a transcript pane (planned), a Request control button, and Approve/Deny buttons for forwarded agent tool calls. The invite secret stays in the URL fragment, so it never reaches any server in an HTTP request.
+**Expert client** (`cmd/backseat-expert`). Web UI served over HTTP. Shows the live terminal via xterm.js, a Request control button, one-tap Approve/Deny cards for forwarded agent approval prompts, and Checkpoint/Rewind buttons (a rewind request needs the novice's confirmation). A transcript pane is still planned. The invite secret stays in the URL fragment, so it never reaches any server in an HTTP request.
 
 ## Protocol messages
 
@@ -25,10 +25,11 @@ All messages are JSON over WebSocket inside the `Message` envelope (`type`, `id`
 | `term_input` | Keystrokes from the current controller to the PTY | `session_id`, `data` (base64) |
 | `term_output` | PTY output broadcast to all attached viewers | `session_id`, `data` (base64) |
 | `transcript_event` | Parsed harness event from a transcript adapter | `session_id`, `harness`, `kind`, `text`, `fields` |
-| `approval_request` | Agent tool approval forwarded to the expert | `session_id`, `approval_id`, `tool`, `summary`, `command` |
-| `approval_response` | Expert's one-tap decision | `session_id`, `approval_id`, `approved` |
+| `approval_request` | Agent approval prompt forwarded to the expert | `session_id`, `approval_id`, `tool`, `summary`, `prompt`, `approve_label`, `deny_label`, `expires_at` |
+| `approval_response` | Expert's one-tap decision (or the host's broadcast dismissal) | `session_id`, `approval_id`, `approved`, `responder`, `broadcast` |
 | `checkpoint_create` | Snapshot the working tree before risky work | `session_id`, `label` |
-| `checkpoint_restore` | Rewind the working tree to a checkpoint | `session_id`, `label` |
+| `checkpoint_restore` | Request a rewind of the working tree to a checkpoint | `session_id`, `label` |
+| `checkpoint_event` | Checkpoint lifecycle broadcast (`created`, `restored`, `restore_requested`, `restore_denied`, `restore_expired`, `failed`) | `session_id`, `action`, `label`, `message` |
 | `session_end` | Terminate the session, drop all attachments | `session_id`, `reason` |
 
 ## Pairing ceremony
@@ -68,9 +69,9 @@ Hard rule: never integrate with a harness's private agent protocol. That is how 
 
 Raw terminal sharing already exists (tmate). Backseat earns its place with three things neither tmate nor the current open-source attempts have:
 
-1. **Approval forwarding.** When the agent asks "run this command?", the prompt is parsed by the transcript adapter and forwarded as `approval_request`. The expert answers with one tap instead of watching the terminal and typing.
+1. **Approval forwarding.** When the agent asks "run this command? [y/n]", the host's prompt matcher (`internal/host/approval.go`, extensible via `RegisterApprovalPattern`) spots it in the PTY stream and forwards an encrypted `approval_request` to the controller (or every enrolled expert when nobody holds control). The expert answers with one tap; the host writes the answer bytes into the PTY and broadcasts the decision so every expert's card dismisses. Approvals expire after 2 minutes and a stale answer can never inject input; ending the session clears all pending approvals.
 2. **Parsed transcript streaming.** The expert sees a structured event feed (tool calls, results, prompts) next to the raw terminal, so they can follow a fast agent without reading scrolling bytes.
-3. **Checkpoints and rewind.** `checkpoint_create` snapshots the working tree before risky expert-driven work; `checkpoint_restore` rewinds it. The expert can undo, which is what makes handing control to someone else safe to try.
+3. **Checkpoints and rewind.** `checkpoint_create` snapshots the working tree before risky expert-driven work; `checkpoint_restore` asks the novice to confirm a rewind to it. Git workdirs are snapshotted with `git stash create` (tracked changes) plus a temp sidecar for untracked files; other directories get a full copy. Every restore auto-checkpoints the current state first, so a rewind is itself reversible. The expert can undo, which is what makes handing control to someone else safe to try.
 
 ## Security model
 
@@ -92,7 +93,7 @@ Run on one machine with two terminals (or two machines on a LAN):
 4. Open the link in a browser. Confirm the live terminal mirrors the agent.
 5. Click Request control. In the host terminal, type `grant`.
 6. Type into the browser terminal. Confirm the keystrokes drive the agent on the host.
-7. Agent tool approval forwarding: deferred to v0.3 (no Approve/Deny buttons in v0.1).
+7. Agent tool approval forwarding: trigger an approval prompt in the agent (e.g. a `[y/n]` question). Confirm the expert UI shows an Approve/Deny card, answer it, and confirm the agent receives the answer. Trigger a second prompt while one is pending and confirm it is not double-forwarded.
 8. In the host terminal, type `end`. Confirm the browser shows the session ended.
 
 Demo complete checklist: invite link works, terminal mirrors, control request plus novice grant, expert drives the agent, clean teardown.
@@ -104,7 +105,7 @@ What actually shipped in v0.1, and where it deliberately diverged from the spec 
 - **Pairing: secret presentation, not the HMAC ceremony.** The host generated a 32-byte secret, put `secret_hash` (hex SHA-256) in `session_announce`, and built the invite as `{base}/?session={id}#secret={b64url}` (the expert UI also accepts the spec's `/join/{id}` path form). The expert presented the secret inside its first `room_join` payload; the relay verified it in constant time against the stored hash. Post-v0.1 this was replaced by the real ceremony: `room_join` carries no secret, and the host verifies an HMAC-SHA256 challenge-response before deriving the E2E keys.
 - **Relay was trusted in v0.1.** Envelopes were plaintext JSON on the wire; the "untrusted relay" claims in this doc were the target state. E2E encryption has since landed, and the relay no longer sees secrets or content.
 - **Control was enforced twice in v0.1.** The host daemon was authoritative (expert `term_input` applied to the PTY only while an expert held control); the relay also tracked the controller per room and dropped `term_input` from anyone else. Now the host enforces alone, and it checks the sender is the specific controller, not just that someone holds control. `control_yield` from either side returns control to the novice. The host auto-denies a second concurrent request while one is pending.
-- **Host stdin is a command console, not a PTY keyboard.** `grant`, `deny [reason]`, `yield`, `kick <name> [reason]`, `end`, `help`. Novice typing directly into the agent's PTY is deferred.
+- **Host stdin is a command console, not a PTY keyboard.** `grant`, `deny [reason]`, `yield`, `kick <name> [reason]`, `end`, `checkpoint <label>`, `checkpoints`, `rewind <label>`, `confirm-rewind`, `deny-rewind [reason]`, `help`. Novice typing directly into the agent's PTY is deferred.
 - **Join race.** The host announces asynchronously, so an instant join can hit `no_session`. The expert UI retries the join a few times on `no_session`; anything else fails fast.
 - **Relay robustness.** The write pump drains queued envelopes before the socket closes, so `session_end` is never lost on teardown; `enqueue` is safe against concurrently closed peers; `dropRoom` clears room state.
 - **Single use is approximated.** Invites expire after 10 minutes; strict single-use (burn on first join) is not yet enforced.
@@ -113,5 +114,5 @@ What actually shipped in v0.1, and where it deliberately diverged from the spec 
 
 - **v0.1** PTY sharing plus control handoff with novice consent (this repo's skeleton).
 - **v0.2** Transcript adapters for claude, copilot, opencode, aider; transcript pane in the expert UI.
-- **v0.3** Approval forwarding, checkpoints and rewind, audit log.
+- **v0.3** Transcript adapters, audit log. (Approval forwarding and checkpoints/rewind landed after v0.1.)
 - **v0.4** NAT traversal and direct transport (WireGuard-style peer link) so the relay becomes optional; hosted relay stays as fallback.

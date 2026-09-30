@@ -27,6 +27,7 @@ const (
 	TypeApprovalResponse  = "approval_response"
 	TypeCheckpointCreate  = "checkpoint_create"
 	TypeCheckpointRestore = "checkpoint_restore"
+	TypeCheckpointEvent   = "checkpoint_event"
 	TypeSessionEnd        = "session_end"
 	TypeError             = "error"
 )
@@ -174,20 +175,32 @@ type TranscriptEvent struct {
 	Fields    map[string]any `json:"fields,omitempty"`
 }
 
-// ApprovalRequest forwards an agent tool approval prompt to the expert.
+// ApprovalRequest forwards an agent approval prompt detected in the PTY
+// stream to the expert. Prompt is the raw prompt text as seen in the
+// terminal; ApproveAnswer/DenyAnswer are the exact bytes the host will
+// write to the PTY for each decision (usually "y\n" / "n\n").
 type ApprovalRequest struct {
-	SessionID  string `json:"session_id"`
-	ApprovalID string `json:"approval_id"`
-	Tool       string `json:"tool"`
-	Summary    string `json:"summary"`
-	Command    string `json:"command,omitempty"`
+	SessionID    string `json:"session_id"`
+	ApprovalID   string `json:"approval_id"`
+	Tool         string `json:"tool"`
+	Summary      string `json:"summary"`
+	Command      string `json:"command,omitempty"`
+	Prompt       string `json:"prompt,omitempty"`
+	ApproveLabel string `json:"approve_label,omitempty"` // button text, default "Approve"
+	DenyLabel    string `json:"deny_label,omitempty"`    // button text, default "Deny"
+	ExpiresAt    int64  `json:"expires_at,omitempty"`    // unix seconds
 }
 
-// ApprovalResponse carries the expert's one-tap decision.
+// ApprovalResponse carries an approval decision. It travels expert -> host
+// (the decision) and is then broadcast host -> experts so every client can
+// dismiss the prompt card; in the broadcast direction Responder names who
+// decided and Broadcast is true.
 type ApprovalResponse struct {
 	SessionID  string `json:"session_id"`
 	ApprovalID string `json:"approval_id"`
 	Approved   bool   `json:"approved"`
+	Responder  string `json:"responder,omitempty"`
+	Broadcast  bool   `json:"broadcast,omitempty"`
 }
 
 // CheckpointCreate snapshots the session (git stash style) before risky work.
@@ -200,6 +213,17 @@ type CheckpointCreate struct {
 type CheckpointRestore struct {
 	SessionID string `json:"session_id"`
 	Label     string `json:"label"`
+}
+
+// CheckpointEvent reports checkpoint lifecycle outcomes to experts.
+// Action is one of: created, restored, restore_requested, restore_denied,
+// restore_expired, failed. For restore_requested the novice must confirm
+// via their console before the rewind happens.
+type CheckpointEvent struct {
+	SessionID string `json:"session_id"`
+	Action    string `json:"action"`
+	Label     string `json:"label,omitempty"`
+	Message   string `json:"message,omitempty"`
 }
 
 // SessionEnd terminates the session and drops all attachments.

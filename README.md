@@ -27,7 +27,7 @@ The relay is untrusted by design: payloads are end-to-end encrypted and it only 
 
 ### Deferred (see ARCHITECTURE.md roadmap)
 
-- Transcript adapters, approval forwarding with one-tap buttons, checkpoints and rewind (v0.2/v0.3).
+- Approval forwarding with one-tap Approve/Deny buttons and checkpoints with novice-confirmed rewind (landed after v0.1). Transcript adapters and the audit log are still ahead (v0.2/v0.3).
 - Novice typing directly into the PTY: in v0.1 the host stdin is a command console only.
 - NAT traversal / direct transport (v0.4).
 
