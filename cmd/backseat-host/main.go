@@ -62,6 +62,7 @@ func main() {
 	fmt.Println("  " + invite)
 	fmt.Println()
 	fmt.Println("Commands: grant | deny [reason] | yield | kick <name> [reason] | end")
+	fmt.Println("          checkpoint <label> | checkpoints | rewind <label> | confirm-rewind | deny-rewind [reason]")
 
 	h, err := host.New(host.Config{
 		RelayURL:  u.String(),
@@ -110,8 +111,50 @@ func main() {
 			h.End("novice ended the session")
 			fmt.Println("[backseat] session ended.")
 			return
+		case "checkpoint":
+			if rest == "" {
+				fmt.Println("[backseat] usage: checkpoint <label>")
+				continue
+			}
+			if _, err := h.Checkpoint(rest); err != nil {
+				fmt.Println("[backseat]", err)
+			} else {
+				fmt.Println("[backseat] checkpoint", rest, "created.")
+			}
+		case "checkpoints":
+			cps := h.ListCheckpoints()
+			if len(cps) == 0 {
+				fmt.Println("[backseat] no checkpoints yet.")
+				continue
+			}
+			for _, cp := range cps {
+				fmt.Printf("[backseat] %-24s %s (%s)\n", cp.Label, cp.CreatedAt.Format("15:04:05"), cp.Kind)
+			}
+		case "rewind":
+			if rest == "" {
+				fmt.Println("[backseat] usage: rewind <label>")
+				continue
+			}
+			if err := h.RestoreCheckpoint(rest); err != nil {
+				fmt.Println("[backseat]", err)
+			} else {
+				fmt.Println("[backseat] rewound to", rest)
+			}
+		case "confirm-rewind":
+			if err := h.ConfirmRewind(); err != nil {
+				fmt.Println("[backseat]", err)
+			} else {
+				fmt.Println("[backseat] rewind confirmed and executed.")
+			}
+		case "deny-rewind":
+			if err := h.DenyRewind(rest); err != nil {
+				fmt.Println("[backseat]", err)
+			} else {
+				fmt.Println("[backseat] rewind denied.")
+			}
 		case "help":
 			fmt.Println("[backseat] commands: grant | deny [reason] | yield | kick <name> [reason] | end")
+			fmt.Println("[backseat]           checkpoint <label> | checkpoints | rewind <label> | confirm-rewind | deny-rewind [reason]")
 		default:
 			fmt.Println("[backseat] unknown command. Type 'help'.")
 		}

@@ -36,6 +36,12 @@ body { background: #0d1117; color: #c9d1d9; font-family: system-ui, sans-serif; 
 button { background: #238636; color: #fff; border: 0; border-radius: 6px; padding: 8px 14px; cursor: pointer; }
 button:disabled { background: #30363d; cursor: default; }
 #term { height: calc(100vh - 60px); padding: 8px; }
+#approvals { display: flex; flex-direction: column; gap: 8px; padding: 8px 16px; }
+.appr { background: #161b22; border: 1px solid #d29922; border-radius: 8px; padding: 10px 12px; }
+.appr .q { font-family: monospace; white-space: pre-wrap; margin: 6px 0 10px; }
+.appr button { margin-right: 8px; }
+.appr .deny { background: #a40e26; }
+
 </style>
 </head>
 <body>
@@ -45,7 +51,10 @@ button:disabled { background: #30363d; cursor: default; }
   <span id="status">connecting…</span>
   <button id="req">Request control</button>
   <button id="yield" disabled>Yield control</button>
+  <button id="ckpt">Checkpoint</button>
+  <button id="rewind">Rewind</button>
 </div>
+<div id="approvals"></div>
 <div id="term"></div>
 <script src="/static/xterm.js"></script>
 <script src="/static/crypto.js"></script>
@@ -68,6 +77,9 @@ button:disabled { background: #30363d; cursor: default; }
   var mode = document.getElementById('mode');
   var reqBtn = document.getElementById('req');
   var yieldBtn = document.getElementById('yield');
+  var ckptBtn = document.getElementById('ckpt');
+  var rewindBtn = document.getElementById('rewind');
+  var approvalsBox = document.getElementById('approvals');
   var term = new Terminal({ cursorBlink: true });
   term.open(document.getElementById('term'));
 
@@ -162,6 +174,8 @@ button:disabled { background: #30363d; cursor: default; }
       status.textContent = 'Error: ' + (pe.message || pe.code);
       reqBtn.disabled = true;
       yieldBtn.disabled = true;
+      ckptBtn.disabled = true;
+      rewindBtn.disabled = true;
       return;
     }
     if (msg.type === 'session_end') {
@@ -198,6 +212,62 @@ button:disabled { background: #30363d; cursor: default; }
       setMode(false, 'VIEWING');
       setSecure('control returned to the novice — encrypted');
     }
+    else if (msg.type === 'approval_request') showApproval(p);
+    else if (msg.type === 'approval_response' && p.broadcast) dismissApproval(p.approval_id);
+    else if (msg.type === 'checkpoint_event') {
+      term.writeln('');
+      term.writeln('[checkpoint] ' + (p.action || '') +
+        (p.label ? ' "' + p.label + '"' : '') +
+        (p.message ? ': ' + p.message : ''));
+    }
+  }
+
+  function showApproval(p) {
+    if (!p.approval_id || document.getElementById('appr-' + p.approval_id)) return;
+    var card = document.createElement('div');
+    card.className = 'appr';
+    card.id = 'appr-' + p.approval_id;
+    var title = document.createElement('div');
+    title.innerHTML = '<strong>Approval needed</strong>' +
+      (p.tool ? ' <span style="color:#8b949e">(' + esc(p.tool) + ')</span>' : '');
+    var q = document.createElement('div');
+    q.className = 'q';
+    q.textContent = p.prompt || p.summary || '';
+    var ok = document.createElement('button');
+    ok.textContent = p.approve_label || 'Approve';
+    var no = document.createElement('button');
+    no.className = 'deny';
+    no.textContent = p.deny_label || 'Deny';
+    ok.onclick = function () { answerApproval(p.approval_id, true); };
+    no.onclick = function () { answerApproval(p.approval_id, false); };
+    card.appendChild(title);
+    card.appendChild(q);
+    card.appendChild(ok);
+    card.appendChild(no);
+    approvalsBox.appendChild(card);
+    // Auto-dismiss when the host-side TTL passes.
+    if (p.expires_at) {
+      var ms = p.expires_at * 1000 - Date.now();
+      if (ms > 0) setTimeout(function () { dismissApproval(p.approval_id); }, ms + 1000);
+    }
+  }
+
+  function dismissApproval(id) {
+    var el = document.getElementById('appr-' + id);
+    if (el) el.remove();
+  }
+
+  function esc(s) {
+    return String(s).replace(/[&<>"]/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c];
+    });
+  }
+
+  async function answerApproval(id, approved) {
+    dismissApproval(id);
+    if (!enrolled) return;
+    await sendEncrypted('approval_response', { session_id: sessionId,
+      approval_id: id, approved: approved });
   }
 
   term.onData(function (d) {
@@ -216,6 +286,21 @@ button:disabled { background: #30363d; cursor: default; }
     sendEncrypted('control_yield', { session_id: sessionId, expert_name: myName });
     setMode(false, 'VIEWING');
     setSecure('control returned to the novice — encrypted');
+  };
+  ckptBtn.onclick = function () {
+    if (!enrolled) { status.textContent = 'still enrolling…'; return; }
+    var label = prompt('Checkpoint label:', 'before-change');
+    if (!label) return;
+    sendEncrypted('checkpoint_create', { session_id: sessionId, label: label });
+    status.textContent = 'checkpoint "' + label + '" requested…';
+  };
+  rewindBtn.onclick = function () {
+    if (!enrolled) { status.textContent = 'still enrolling…'; return; }
+    var label = prompt('Rewind to checkpoint:', '');
+    if (!label) return;
+    if (!confirm('Rewind to "' + label + '"? The novice must confirm. Files changed since the checkpoint will be reverted.')) return;
+    sendEncrypted('checkpoint_restore', { session_id: sessionId, label: label });
+    status.textContent = 'rewind to "' + label + '" requested — waiting on the novice…';
   };
 
   connect();
