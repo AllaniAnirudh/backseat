@@ -1,0 +1,38 @@
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+/bin/
+/dist/
+
+# Build artifacts
+backseat-host
+backseat-relay
+backseat-expert
+
+# Go workspace
+go.work
+go.work.sum
+
+# Dependency dirs
+vendor/
+
+# IDE and editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test and coverage output
+coverage.out
+coverage.html
+*.prof
