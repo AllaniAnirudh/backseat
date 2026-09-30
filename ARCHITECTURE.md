@@ -4,7 +4,7 @@
 
 **Host daemon** (`cmd/backseat-host`, `internal/pty`). Runs on the novice's machine. Wraps the agent command in a PTY via creack/pty, announces the session to the relay, prints the one-time invite link, and enforces control state locally: only the current controller's input reaches the PTY. The novice approves or denies control requests by typing `grant` or `deny` in the host terminal, and can kill the session at any time with `end`.
 
-**Relay server** (`cmd/backseat-relay`, `internal/relay`). Self-hostable WebSocket relay. Rooms are keyed by session id; the relay forwards JSON envelopes between host and experts, gates joins on the invite secret, and tracks the controller so only the current controller's input reaches the host. End-to-end encryption of payloads is the v0.3 target; in v0.1 envelopes travel in plaintext, so self-host the relay. See "v0.1 implementation notes".
+**Relay server** (`cmd/backseat-relay`, `internal/relay`). Self-hostable WebSocket relay, untrusted by design. Rooms are keyed by session id; the relay forwards JSON envelopes between host and experts, routing by the plaintext `to`/`from` fields. It admits joins while the invite is fresh, marks newcomers pending until the host confirms their HMAC enrollment, and drops peers that never complete it (60s). It keeps no content keys and tracks no control state: only the host decides whose input reaches the PTY.
 
 **Expert client** (`cmd/backseat-expert`). Web UI served over HTTP. Shows the live terminal via xterm.js, a transcript pane (planned), a Request control button, and Approve/Deny buttons for forwarded agent tool calls. The invite secret stays in the URL fragment, so it never reaches any server in an HTTP request.
 
@@ -35,13 +35,16 @@ All messages are JSON over WebSocket inside the `Message` envelope (`type`, `id`
 
 Stolen from copilot-agent-mesh's design, reimplemented CLI-first with no editor dependency.
 
-1. The host generates a random 32-byte secret and builds a one-time invite URL: `{base}/join/{session_id}#secret={base64url}`. The secret lives only in the URL fragment, so it is never sent to any server.
-2. The invite expires after 10 minutes and is single use. Expired or reused invites fail closed.
-3. Two-phase enrollment over the relay:
+1. The host generates a random 32-byte secret and builds a one-time invite URL: `{base}/?session={id}#secret={base64url}` (the expert UI also accepts the `/join/{id}` path form). The secret lives only in the URL fragment, so it is never sent to any server.
+2. The invite expires after 10 minutes. Expired invites fail closed.
+3. The expert's `room_join` carries no secret. The relay admits it while the invite is fresh, marks the peer pending, and forwards the join to the host. The newcomer receives nothing until enrollment completes.
+4. Two-phase enrollment over the relay, routed by name:
    - Phase 1: the host sends a fresh random 32-byte challenge (`pairing_enroll`, `phase: 1`).
-   - Phase 2: the expert replies with HMAC-SHA256(secret, challenge) (`phase: 2`). The host verifies in constant time. The secret itself never crosses the wire.
-4. Both sides run HKDF-SHA256(secret, salt=challenge, info="backseat-v1-pairing") locally and split the 64-byte output into two directional keys: host-to-expert and expert-to-host. Keys are never transmitted.
-5. Enrollment commit is idempotent: replaying a completed enrollment returns the existing session keys instead of creating a second pairing.
+   - Phase 2: the expert replies with HMAC-SHA256(secret, challenge) (`phase: 2`). The host verifies in constant time. The secret itself never crosses the wire. A wrong answer gets a plaintext `peer_kick`, which the relay enforces.
+   - Phase 3: the host confirms enrollment (`phase: 3`) and follows with the session announcement encrypted for that expert.
+5. Both sides run HKDF-SHA256(secret, salt=challenge, info="backseat-v1-pairing") locally and split the 64-byte output into two directional keys: host-to-expert and expert-to-host. Keys are never transmitted. The browser derives the identical bytes through WebCrypto; a shared test vector pins the interop.
+6. From here on, every host<->expert payload is an AES-256-GCM envelope (`{"v":1,"alg":"AES-256-GCM","nonce":b64,"ct":b64}`). The envelope's `type`/`to`/`from` stay plaintext for routing; `from` is only a key-selection hint, because a spoofed sender just fails AEAD decryption and is dropped.
+7. Terminal output is encrypted separately per enrolled expert with their host-to-expert key.
 
 ## Control model
 
@@ -74,7 +77,8 @@ Raw terminal sharing already exists (tmate). Backseat earns its place with three
 - **Default deny.** Nothing is shared until the novice runs the host and hands out a link. No open ports on the novice's machine; the host dials out to the relay.
 - **Scoped grants.** Invites are session-scoped, single use, and expire in 10 minutes. Control grants cover one session and end with it.
 - **Novice kill switch.** Typing `end` in the host terminal (or killing the process) terminates the session, drops all relay attachments, and closes the PTY.
-- **Untrusted relay.** Payloads are end-to-end encrypted with the paired keys. The relay routes opaque envelopes and cannot read session contents.
+- **Untrusted relay.** Payloads are end-to-end encrypted with the paired keys (AES-256-GCM, directional keys from HKDF-SHA256). The relay routes opaque envelopes and only ever sees message types, the `to`/`from` routing fields, session ids, and timing.
+- **No forward secrecy yet.** Keys derive from the long-lived invite secret, so a leaked secret decrypts that session's recorded traffic. Each session mints a fresh secret, which bounds the exposure to one session. Ephemeral ECDH for forward secrecy is future work.
 - **Audit log.** The host records every expert action (control grants, inputs while controlling, approval decisions, checkpoint restores) to a local append-only log for later review. Planned for v0.3.
 - **No private protocol integrations.** Fewer secrets, fewer vendor handshakes, smaller attack surface.
 
@@ -95,11 +99,11 @@ Demo complete checklist: invite link works, terminal mirrors, control request pl
 
 ## v0.1 implementation notes
 
-What actually shipped, and where it deliberately diverges from the spec above.
+What actually shipped in v0.1, and where it deliberately diverged from the spec above.
 
-- **Pairing: secret presentation, not the HMAC ceremony.** The host generates a 32-byte secret, puts `secret_hash` (hex SHA-256) in `session_announce`, and builds the invite as `{base}/?session={id}#secret={b64url}` (the expert UI also accepts the spec's `/join/{id}` path form). The expert presents the secret inside its first `room_join` payload; the relay verifies it in constant time against the stored hash. Wrong secret gets a `bad_secret` error and a closed connection; the secret never appears in relay logs. The two-phase HMAC enrollment and HKDF key derivation from the spec are deferred to v0.3 alongside E2E encryption.
-- **Relay is trusted in v0.1.** Envelopes are plaintext JSON on the wire. The "untrusted relay" claims in this doc are the target state for v0.3, not current behavior. Self-host the relay.
-- **Control is enforced twice.** The host daemon is authoritative (expert `term_input` is applied to the PTY only while an expert holds control); the relay also tracks the controller per room and drops `term_input` from anyone else. `control_yield` from either side returns control to the novice. The host auto-denies a second concurrent request while one is pending.
+- **Pairing: secret presentation, not the HMAC ceremony.** The host generated a 32-byte secret, put `secret_hash` (hex SHA-256) in `session_announce`, and built the invite as `{base}/?session={id}#secret={b64url}` (the expert UI also accepts the spec's `/join/{id}` path form). The expert presented the secret inside its first `room_join` payload; the relay verified it in constant time against the stored hash. Post-v0.1 this was replaced by the real ceremony: `room_join` carries no secret, and the host verifies an HMAC-SHA256 challenge-response before deriving the E2E keys.
+- **Relay was trusted in v0.1.** Envelopes were plaintext JSON on the wire; the "untrusted relay" claims in this doc were the target state. E2E encryption has since landed, and the relay no longer sees secrets or content.
+- **Control was enforced twice in v0.1.** The host daemon was authoritative (expert `term_input` applied to the PTY only while an expert held control); the relay also tracked the controller per room and dropped `term_input` from anyone else. Now the host enforces alone, and it checks the sender is the specific controller, not just that someone holds control. `control_yield` from either side returns control to the novice. The host auto-denies a second concurrent request while one is pending.
 - **Host stdin is a command console, not a PTY keyboard.** `grant`, `deny [reason]`, `yield`, `kick <name> [reason]`, `end`, `help`. Novice typing directly into the agent's PTY is deferred.
 - **Join race.** The host announces asynchronously, so an instant join can hit `no_session`. The expert UI retries the join a few times on `no_session`; anything else fails fast.
 - **Relay robustness.** The write pump drains queued envelopes before the socket closes, so `session_end` is never lost on teardown; `enqueue` is safe against concurrently closed peers; `dropRoom` clears room state.
@@ -109,5 +113,5 @@ What actually shipped, and where it deliberately diverges from the spec above.
 
 - **v0.1** PTY sharing plus control handoff with novice consent (this repo's skeleton).
 - **v0.2** Transcript adapters for claude, copilot, opencode, aider; transcript pane in the expert UI.
-- **v0.3** Approval forwarding, E2E payload encryption from pairing keys, checkpoints and rewind, audit log.
+- **v0.3** Approval forwarding, checkpoints and rewind, audit log.
 - **v0.4** NAT traversal and direct transport (WireGuard-style peer link) so the relay becomes optional; hosted relay stays as fallback.

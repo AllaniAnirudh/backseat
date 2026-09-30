@@ -1,6 +1,7 @@
 // Package host implements the novice side of a backseat session: it wraps
-// the agent command in a PTY, announces the session to the relay, streams
-// terminal output out, and enforces control state locally. Only the current
+// the agent command in a PTY, announces the session to the relay, runs the
+// HMAC enrollment for each joining expert, then streams terminal output
+// encrypted per expert and enforces control state locally. Only the current
 // controller's input reaches the PTY, and the host tracks that state itself
 // so a compromised relay cannot grant input rights on its own.
 //
@@ -13,6 +14,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -55,6 +57,13 @@ type Host struct {
 	controller string
 	// pending is the expert name awaiting a grant/deny decision.
 	pending string
+	// pendingChallenges holds the in-flight HMAC challenge per joining expert.
+	pendingChallenges map[string][pairing.SecretLen]byte
+	// enrolled holds the derived directional keys per enrolled expert.
+	enrolled map[string]pairing.Keys
+	// announce is the session description, sent plaintext to the relay and
+	// encrypted to each expert after enrollment.
+	announce protocol.SessionAnnounce
 
 	idSeq      int64
 	shutOnce   sync.Once
@@ -86,20 +95,24 @@ func New(cfg Config) (*Host, error) {
 		sess.Close()
 		return nil, fmt.Errorf("host: dial relay: %w", err)
 	}
-	h := &Host{
-		cfg:        cfg,
-		conn:       conn,
-		sess:       sess,
-		terminated: make(chan struct{}),
-	}
-	if err := h.send(protocol.TypeSessionAnnounce, protocol.SessionAnnounce{
+	announce := protocol.SessionAnnounce{
 		SessionID:  cfg.SessionID,
 		HostName:   cfg.HostName,
 		Harness:    cfg.Harness,
 		AgentCmd:   strings.Join(cfg.AgentCmd, " "),
 		SecretHash: pairing.Verifier(cfg.Secret),
 		ExpiresAt:  time.Now().Add(pairing.InviteTTL).Unix(),
-	}); err != nil {
+	}
+	h := &Host{
+		cfg:               cfg,
+		conn:              conn,
+		sess:              sess,
+		pendingChallenges: make(map[string][pairing.SecretLen]byte),
+		enrolled:          make(map[string]pairing.Keys),
+		announce:          announce,
+		terminated:        make(chan struct{}),
+	}
+	if err := h.send(protocol.TypeSessionAnnounce, announce); err != nil {
 		sess.Close()
 		conn.Close()
 		return nil, fmt.Errorf("host: announce: %w", err)
@@ -116,18 +129,78 @@ func (h *Host) event(s string) {
 	}
 }
 
+// send writes a plaintext envelope (relay-readable control types only:
+// session_announce, pairing_enroll, peer_kick, session_end).
 func (h *Host) send(msgType string, payload any) error {
+	return h.sendRouted(msgType, payload, "")
+}
+
+// sendRouted writes a plaintext envelope addressed to one expert.
+func (h *Host) sendRouted(msgType string, payload any, to string) error {
 	h.idSeq++
 	msg, err := protocol.New(msgType, newID(), time.Now().UnixMilli(), payload)
 	if err != nil {
 		return err
+	}
+	msg.To = to
+	msg.From = h.cfg.HostName
+	h.writeMu.Lock()
+	defer h.writeMu.Unlock()
+	return h.conn.WriteJSON(msg)
+}
+
+// sendTo encrypts the payload with the expert's HostToExpert key and routes
+// it to them. It fails if the expert has not completed enrollment.
+func (h *Host) sendTo(expert, msgType string, payload any) error {
+	h.mu.Lock()
+	ks, ok := h.enrolled[expert]
+	h.mu.Unlock()
+	if !ok {
+		return fmt.Errorf("host: expert %q not enrolled", expert)
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	env, err := pairing.Seal(ks.HostToExpert, raw)
+	if err != nil {
+		return err
+	}
+	h.idSeq++
+	msg := protocol.Message{
+		Type:      msgType,
+		ID:        newID(),
+		Timestamp: time.Now().UnixMilli(),
+		To:        expert,
+		From:      h.cfg.HostName,
+		Payload:   env,
 	}
 	h.writeMu.Lock()
 	defer h.writeMu.Unlock()
 	return h.conn.WriteJSON(msg)
 }
 
-// pumpOutput streams PTY output to the relay and the local mirror.
+// decryptFrom opens an expert's envelope with their ExpertToHost key. A
+// failed open — wrong key, tampered bytes, or a spoofed From — drops the
+// message.
+func (h *Host) decryptFrom(from string, payload json.RawMessage) ([]byte, bool) {
+	h.mu.Lock()
+	ks, ok := h.enrolled[from]
+	h.mu.Unlock()
+	if !ok {
+		return nil, false
+	}
+	raw, err := pairing.Open(ks.ExpertToHost, payload)
+	if err != nil {
+		return nil, false
+	}
+	return raw, true
+}
+
+// pumpOutput streams PTY output to the relay and the local mirror. Each
+// enrolled expert gets their own copy, encrypted with their HostToExpert
+// key: the relay routes opaque envelopes and learns nothing about the
+// content.
 func (h *Host) pumpOutput() {
 	defer h.wg.Done()
 	ch := h.sess.Subscribe()
@@ -138,10 +211,18 @@ func (h *Host) pumpOutput() {
 			copy(cp, b)
 			h.cfg.OnOutput(cp)
 		}
-		_ = h.send(protocol.TypeTermOutput, protocol.TermOutput{
-			SessionID: h.cfg.SessionID,
-			Data:      base64.StdEncoding.EncodeToString(b),
-		})
+		h.mu.Lock()
+		names := make([]string, 0, len(h.enrolled))
+		for n := range h.enrolled {
+			names = append(names, n)
+		}
+		h.mu.Unlock()
+		for _, n := range names {
+			_ = h.sendTo(n, protocol.TypeTermOutput, protocol.TermOutput{
+				SessionID: h.cfg.SessionID,
+				Data:      base64.StdEncoding.EncodeToString(b),
+			})
+		}
 	}
 	// Agent exited: end the session for everyone and tear down locally.
 	h.endWithReason("agent exited")
@@ -158,35 +239,50 @@ func (h *Host) readLoop() {
 			return
 		}
 		switch msg.Type {
+		case protocol.TypeRoomJoin:
+			var join protocol.RoomJoin
+			if msg.Decode(&join) != nil || join.ExpertName == "" {
+				continue
+			}
+			h.onJoin(join.ExpertName)
+		case protocol.TypePairingEnroll:
+			var pe protocol.PairingEnroll
+			if msg.Decode(&pe) != nil {
+				continue
+			}
+			if pe.Phase == 2 {
+				h.onEnrollResponse(msg.From, pe)
+			}
 		case protocol.TypeControlRequest:
+			raw, ok := h.decryptFrom(msg.From, msg.Payload)
+			if !ok {
+				continue
+			}
 			var req protocol.ControlRequest
-			if msg.Decode(&req) != nil {
+			if json.Unmarshal(raw, &req) != nil {
 				continue
 			}
 			h.onRequest(req)
 		case protocol.TypeControlYield:
-			// Control returns to the novice, whether the expert yielded
-			// voluntarily or the host reclaimed it.
+			raw, ok := h.decryptFrom(msg.From, msg.Payload)
+			if !ok {
+				continue
+			}
+			var y protocol.ControlYield
+			if json.Unmarshal(raw, &y) != nil {
+				continue
+			}
+			// Only the actual controller can release control.
 			h.mu.Lock()
-			h.controller = ""
-			h.mu.Unlock()
-			h.event("control returned to you")
+			if h.controller != "" && h.controller == msg.From {
+				h.controller = ""
+				h.mu.Unlock()
+				h.event("control returned to you")
+			} else {
+				h.mu.Unlock()
+			}
 		case protocol.TypeTermInput:
-			h.mu.Lock()
-			held := h.controller != ""
-			h.mu.Unlock()
-			if !held {
-				continue // host holds control; no expert input applies
-			}
-			var in protocol.TermInput
-			if msg.Decode(&in) != nil {
-				continue
-			}
-			raw, err := base64.StdEncoding.DecodeString(in.Data)
-			if err != nil {
-				continue
-			}
-			h.sess.Write(raw)
+			h.onInput(msg)
 		case protocol.TypeSessionEnd:
 			h.event("session ended by relay")
 			h.shutdown()
@@ -195,48 +291,158 @@ func (h *Host) readLoop() {
 	}
 }
 
-func (h *Host) onRequest(req protocol.ControlRequest) {
-	// Decide must be fast and non-blocking: it runs with the state lock held.
+// onJoin starts the HMAC enrollment for a newcomer: a fresh challenge goes
+// out as plaintext phase 1, routed to them by name.
+func (h *Host) onJoin(name string) {
+	ch, err := pairing.NewChallenge()
+	if err != nil {
+		return
+	}
 	h.mu.Lock()
-	defer h.mu.Unlock()
+	h.pendingChallenges[name] = ch
+	h.mu.Unlock()
+	h.event(fmt.Sprintf("%s joined, enrolling…", name))
+	_ = h.sendRouted(protocol.TypePairingEnroll, protocol.PairingEnroll{
+		SessionID: h.cfg.SessionID,
+		Phase:     1,
+		Challenge: base64.StdEncoding.EncodeToString(ch[:]),
+	}, name)
+}
+
+// onEnrollResponse verifies the phase 2 HMAC. Success derives the
+// directional keys, acks with plaintext phase 3, and follows with the
+// session announcement encrypted for that expert. Failure kicks the peer
+// with a plaintext peer_kick the relay can act on.
+func (h *Host) onEnrollResponse(from string, pe protocol.PairingEnroll) {
+	if from == "" {
+		return
+	}
+	h.mu.Lock()
+	ch, ok := h.pendingChallenges[from]
+	h.mu.Unlock()
+	if !ok {
+		return
+	}
+	raw, err := base64.StdEncoding.DecodeString(pe.Response)
+	if err != nil || len(raw) != pairing.SecretLen {
+		h.failEnroll(from, "bad response encoding")
+		return
+	}
+	var resp [pairing.SecretLen]byte
+	copy(resp[:], raw)
+	if !pairing.VerifyEnrollment(h.cfg.Secret, ch, resp) {
+		h.failEnroll(from, "bad challenge response")
+		return
+	}
+	keys, err := pairing.DeriveKeys(h.cfg.Secret, ch)
+	if err != nil {
+		h.failEnroll(from, "key derivation failed")
+		return
+	}
+	h.mu.Lock()
+	h.enrolled[from] = keys
+	delete(h.pendingChallenges, from)
+	h.mu.Unlock()
+	h.event(fmt.Sprintf("%s enrolled, channel encrypted", from))
+	_ = h.sendRouted(protocol.TypePairingEnroll, protocol.PairingEnroll{
+		SessionID: h.cfg.SessionID,
+		Phase:     3,
+	}, from)
+	_ = h.sendTo(from, protocol.TypeSessionAnnounce, h.announce)
+}
+
+func (h *Host) failEnroll(name, reason string) {
+	h.mu.Lock()
+	delete(h.pendingChallenges, name)
+	h.mu.Unlock()
+	_ = h.send(protocol.TypePeerKick, protocol.PeerKick{
+		SessionID:  h.cfg.SessionID,
+		ExpertName: name,
+		Reason:     reason,
+	})
+	h.event(fmt.Sprintf("enrollment failed for %s: %s", name, reason))
+}
+
+// onInput applies decrypted expert input to the PTY, but only when the
+// sender is the current controller. Anything else is dropped.
+func (h *Host) onInput(msg protocol.Message) {
+	raw, ok := h.decryptFrom(msg.From, msg.Payload)
+	if !ok {
+		return
+	}
+	h.mu.Lock()
+	controller := h.controller
+	h.mu.Unlock()
+	if controller == "" || msg.From != controller {
+		return
+	}
+	var in protocol.TermInput
+	if json.Unmarshal(raw, &in) != nil {
+		return
+	}
+	data, err := base64.StdEncoding.DecodeString(in.Data)
+	if err != nil {
+		return
+	}
+	h.sess.Write(data)
+}
+
+func (h *Host) onRequest(req protocol.ControlRequest) {
+	h.mu.Lock()
 	if h.pending != "" {
-		h.sendDeny(req.ExpertName, "another request is pending")
+		name := req.ExpertName
+		h.mu.Unlock()
+		h.sendDeny(name, "another request is pending")
 		return
 	}
 	if h.controller == req.ExpertName {
+		h.mu.Unlock()
 		return // already driving
 	}
-	if h.cfg.Decide != nil {
-		if h.cfg.Decide(req) {
-			h.grantLocked(req.ExpertName)
-		} else {
-			h.sendDeny(req.ExpertName, "")
+	// Decide runs with the state lock held: it must be fast and non-blocking.
+	decided := h.cfg.Decide != nil
+	grant := decided && h.cfg.Decide(req)
+	if !decided {
+		h.pending = req.ExpertName
+		note := ""
+		if req.Note != "" {
+			note = " (" + req.Note + ")"
 		}
+		name := req.ExpertName
+		h.mu.Unlock()
+		h.event(fmt.Sprintf("%s requests control%s. Type 'grant' or 'deny'.", name, note))
 		return
 	}
-	h.pending = req.ExpertName
-	note := ""
-	if req.Note != "" {
-		note = " (" + req.Note + ")"
+	name := req.ExpertName
+	if grant {
+		h.controller = name
+		h.pending = ""
 	}
-	h.event(fmt.Sprintf("%s requests control%s. Type 'grant' or 'deny'.", req.ExpertName, note))
+	h.mu.Unlock()
+	if grant {
+		h.sendGrant(name)
+	} else {
+		h.sendDeny(name, "")
+	}
 }
 
 // Grant hands control to the expert with a pending request.
 func (h *Host) Grant() error {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	if h.pending == "" {
+		h.mu.Unlock()
 		return errors.New("host: no pending control request")
 	}
-	h.grantLocked(h.pending)
+	expert := h.pending
+	h.controller = expert
+	h.pending = ""
+	h.mu.Unlock()
+	h.sendGrant(expert)
 	return nil
 }
 
-func (h *Host) grantLocked(expert string) {
-	h.controller = expert
-	h.pending = ""
-	_ = h.send(protocol.TypeControlGrant, protocol.ControlGrant{
+func (h *Host) sendGrant(expert string) {
+	_ = h.sendTo(expert, protocol.TypeControlGrant, protocol.ControlGrant{
 		SessionID:  h.cfg.SessionID,
 		ExpertName: expert,
 	})
@@ -246,17 +452,19 @@ func (h *Host) grantLocked(expert string) {
 // Deny refuses the pending control request.
 func (h *Host) Deny(reason string) error {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	if h.pending == "" {
+		h.mu.Unlock()
 		return errors.New("host: no pending control request")
 	}
-	h.sendDeny(h.pending, reason)
+	expert := h.pending
 	h.pending = ""
+	h.mu.Unlock()
+	h.sendDeny(expert, reason)
 	return nil
 }
 
 func (h *Host) sendDeny(expert, reason string) {
-	_ = h.send(protocol.TypeControlDeny, protocol.ControlDeny{
+	_ = h.sendTo(expert, protocol.TypeControlDeny, protocol.ControlDeny{
 		SessionID:  h.cfg.SessionID,
 		ExpertName: expert,
 		Reason:     reason,
@@ -270,7 +478,7 @@ func (h *Host) Yield() {
 	h.controller = ""
 	h.mu.Unlock()
 	if prev != "" {
-		_ = h.send(protocol.TypeControlYield, protocol.ControlYield{
+		_ = h.sendTo(prev, protocol.TypeControlYield, protocol.ControlYield{
 			SessionID:  h.cfg.SessionID,
 			ExpertName: prev,
 		})
@@ -279,12 +487,14 @@ func (h *Host) Yield() {
 }
 
 // Kick drops one expert from the room. If they held control it returns to
-// the novice.
+// the novice. The kick itself is plaintext so the relay can enforce it.
 func (h *Host) Kick(expert, reason string) {
 	h.mu.Lock()
 	if h.controller == expert {
 		h.controller = ""
 	}
+	delete(h.enrolled, expert)
+	delete(h.pendingChallenges, expert)
 	h.mu.Unlock()
 	_ = h.send(protocol.TypePeerKick, protocol.PeerKick{
 		SessionID:  h.cfg.SessionID,
@@ -306,6 +516,14 @@ func (h *Host) Pending() string {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.pending
+}
+
+// Enrolled reports whether the named expert completed enrollment.
+func (h *Host) Enrolled(name string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	_, ok := h.enrolled[name]
+	return ok
 }
 
 // End terminates the session for everyone and tears down locally.
