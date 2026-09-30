@@ -348,7 +348,7 @@ func (h *Host) readLoop() {
 			if json.Unmarshal(raw, &req) != nil {
 				continue
 			}
-			h.onRequest(req)
+			h.onRequest(msg.From, req)
 		case protocol.TypeControlYield:
 			raw, ok := h.link.Decrypt(msg.From, msg.Payload)
 			if !ok {
@@ -371,6 +371,8 @@ func (h *Host) readLoop() {
 			h.onInput(msg)
 		case protocol.TypeApprovalResponse:
 			h.onApprovalResponse(msg)
+		case protocol.TypeApprovalDecision:
+			h.onApprovalDecisionMsg(msg)
 		case protocol.TypeCheckpointCreate:
 			h.onCheckpointCreate(msg)
 		case protocol.TypeCheckpointRestore:
@@ -485,13 +487,82 @@ func (h *Host) onInput(msg protocol.Message) {
 }
 
 // restoreConfirmTTL is how long the novice has to confirm an
-// expert-requested rewind before it auto-denies (fail closed).
-const restoreConfirmTTL = 60 * time.Second
+// expert-requested rewind before it auto-denies (fail closed). A var so
+// tests can shrink it.
+var restoreConfirmTTL = 60 * time.Second
+
+// takeApproval validates and consumes a pending approval, so its answer
+// can never be applied twice. Only the controller (or any enrolled
+// expert when nobody holds control) may answer, and only while the
+// prompt is fresh.
+func (h *Host) takeApproval(from, id string) (*pendingApproval, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.controller != "" && from != h.controller {
+		return nil, false
+	}
+	appr, ok := h.approvals[id]
+	if !ok || appr.expired(time.Now()) {
+		return nil, false
+	}
+	delete(h.approvals, id)
+	return appr, true
+}
+
+// answerApproval writes the decision's answer bytes to the PTY and
+// dismisses every expert's card.
+func (h *Host) answerApproval(appr *pendingApproval, from string, approved bool) {
+	answer := appr.deny
+	decision := "denied"
+	if approved {
+		answer = appr.approve
+		decision = "approved"
+	}
+	if _, err := h.sess.Write(answer); err != nil {
+		h.event(fmt.Sprintf("approval %s: failed to answer PTY: %v", appr.id, err))
+		return
+	}
+	h.event(fmt.Sprintf("approval %q %s by %s", appr.prompt, decision, from))
+	bc := protocol.ApprovalResponse{
+		SessionID:  h.cfg.SessionID,
+		ApprovalID: appr.id,
+		Approved:   approved,
+		Responder:  from,
+		Broadcast:  true,
+	}
+	recipients := h.link.EnrolledNames()
+	for _, n := range recipients {
+		_ = h.link.SendTo(n, protocol.TypeApprovalResponse, bc)
+	}
+}
+
+// onApprovalDecisionMsg bridges the in-harness approval_decision onto
+// the PTY answer bytes, so a session can mix PTY and in-harness clients.
+func (h *Host) onApprovalDecisionMsg(msg protocol.Message) {
+	raw, ok := h.link.Decrypt(msg.From, msg.Payload)
+	if !ok {
+		return
+	}
+	var dec protocol.ApprovalDecision
+	if json.Unmarshal(raw, &dec) != nil || dec.ApprovalID == "" {
+		return
+	}
+	if dec.DecidedBy != "" && dec.DecidedBy != msg.From {
+		return
+	}
+	if dec.Decision != protocol.ApprovalApprove && dec.Decision != protocol.ApprovalDeny {
+		return
+	}
+	appr, ok := h.takeApproval(msg.From, dec.ApprovalID)
+	if !ok {
+		return
+	}
+	h.answerApproval(appr, msg.From, dec.Decision == protocol.ApprovalApprove)
+}
 
 // onApprovalResponse applies an expert's approval decision: the answer
 // bytes go into the PTY, and every expert's card is dismissed via a
-// broadcast. Only the controller (or any enrolled expert when nobody
-// holds control) may answer, and only while the prompt is still fresh.
+// broadcast.
 func (h *Host) onApprovalResponse(msg protocol.Message) {
 	raw, ok := h.link.Decrypt(msg.From, msg.Payload)
 	if !ok {
@@ -501,43 +572,11 @@ func (h *Host) onApprovalResponse(msg protocol.Message) {
 	if json.Unmarshal(raw, &resp) != nil || resp.ApprovalID == "" || resp.Broadcast {
 		return
 	}
-	h.mu.Lock()
-	if h.controller != "" && msg.From != h.controller {
-		h.mu.Unlock()
-		return // not the controller
+	appr, ok := h.takeApproval(msg.From, resp.ApprovalID)
+	if !ok {
+		return // not the controller, unknown, or stale: never inject
 	}
-	appr, ok := h.approvals[resp.ApprovalID]
-	if !ok || appr.expired(time.Now()) {
-		h.mu.Unlock()
-		return // unknown or stale: never inject a stale answer
-	}
-	delete(h.approvals, resp.ApprovalID)
-	answer := appr.deny
-	decision := "denied"
-	if resp.Approved {
-		answer = appr.approve
-		decision = "approved"
-	}
-	from := msg.From
-	h.mu.Unlock()
-
-	if _, err := h.sess.Write(answer); err != nil {
-		h.event(fmt.Sprintf("approval %s: failed to answer PTY: %v", resp.ApprovalID, err))
-		return
-	}
-	h.event(fmt.Sprintf("approval %q %s by %s", appr.prompt, decision, from))
-	// Dismiss every expert's card.
-	bc := protocol.ApprovalResponse{
-		SessionID:  h.cfg.SessionID,
-		ApprovalID: resp.ApprovalID,
-		Approved:   resp.Approved,
-		Responder:  from,
-		Broadcast:  true,
-	}
-	recipients := h.link.EnrolledNames()
-	for _, n := range recipients {
-		_ = h.link.SendTo(n, protocol.TypeApprovalResponse, bc)
-	}
+	h.answerApproval(appr, msg.From, resp.Approved)
 }
 
 // onCheckpointCreate snapshots the workdir. Experts may only checkpoint
@@ -643,7 +682,8 @@ func (h *Host) ListCheckpoints() []*Checkpoint {
 }
 
 // ConfirmRewind executes the pending expert-requested rewind. The novice
-// calls this from their console; it is the veto gate.
+// calls this from their console; it is the veto gate. It checks the 60s
+// deadline itself: a confirm past the deadline is refused, fail closed.
 func (h *Host) ConfirmRewind() error {
 	h.mu.Lock()
 	pr := h.pendingRestore
@@ -651,6 +691,11 @@ func (h *Host) ConfirmRewind() error {
 	h.mu.Unlock()
 	if pr == nil {
 		return errors.New("host: no pending rewind request")
+	}
+	if time.Since(pr.requested) > restoreConfirmTTL {
+		h.broadcastCheckpointEvent("restore_expired", pr.label, "novice confirmed too late")
+		h.event(fmt.Sprintf("rewind to %q confirmed past the deadline; denied", pr.label))
+		return errors.New("host: rewind request expired")
 	}
 	return h.doRestore(pr.label, "confirmed by novice")
 }
@@ -694,6 +739,9 @@ func (h *Host) doRestore(label, how string) error {
 // broadcastCheckpointEvent sends a checkpoint event to every enrolled
 // expert, encrypted.
 func (h *Host) broadcastCheckpointEvent(action, label, message string) {
+	if h.link == nil {
+		return // hand-built in tests; nothing to send to
+	}
 	ev := protocol.CheckpointEvent{
 		SessionID: h.cfg.SessionID,
 		Action:    action,
@@ -707,25 +755,38 @@ func (h *Host) broadcastCheckpointEvent(action, label, message string) {
 }
 
 // cancelApprovals drops all forwarded prompts. Called on session end:
-// the kill switch always wins over a pending approval.
+// the kill switch always wins over a pending approval. A parked rewind
+// is denied out loud so the expert UI never hangs on it.
 func (h *Host) cancelApprovals() {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	for id := range h.approvals {
 		delete(h.approvals, id)
 	}
+	pr := h.pendingRestore
 	h.pendingRestore = nil
+	h.mu.Unlock()
+	if pr != nil {
+		h.broadcastCheckpointEvent("restore_denied", pr.label, "session ended")
+		h.event(fmt.Sprintf("rewind to %q denied: session ended", pr.label))
+	}
 }
 
-func (h *Host) onRequest(req protocol.ControlRequest) {
-	h.mu.Lock()
-	if h.pending != "" {
-		name := req.ExpertName
-		h.mu.Unlock()
-		h.sendDeny(name, "another request is pending")
+func (h *Host) onRequest(from string, req protocol.ControlRequest) {
+	if from == "" {
 		return
 	}
-	if h.controller == req.ExpertName {
+	// The relay stamps the sender; a payload name that disagrees is a
+	// spoof attempt and is dropped.
+	if req.ExpertName != "" && req.ExpertName != from {
+		return
+	}
+	h.mu.Lock()
+	if h.pending != "" {
+		h.mu.Unlock()
+		h.sendDeny(from, "another request is pending")
+		return
+	}
+	if h.controller == from {
 		h.mu.Unlock()
 		return // already driving
 	}
@@ -733,26 +794,24 @@ func (h *Host) onRequest(req protocol.ControlRequest) {
 	decided := h.cfg.Decide != nil
 	grant := decided && h.cfg.Decide(req)
 	if !decided {
-		h.pending = req.ExpertName
+		h.pending = from
 		note := ""
 		if req.Note != "" {
 			note = " (" + req.Note + ")"
 		}
-		name := req.ExpertName
 		h.mu.Unlock()
-		h.event(fmt.Sprintf("%s requests control%s. Type 'grant' or 'deny'.", name, note))
+		h.event(fmt.Sprintf("%s requests control%s. Type 'grant' or 'deny'.", from, note))
 		return
 	}
-	name := req.ExpertName
 	if grant {
-		h.controller = name
+		h.controller = from
 		h.pending = ""
 	}
 	h.mu.Unlock()
 	if grant {
-		h.sendGrant(name)
+		h.sendGrant(from)
 	} else {
-		h.sendDeny(name, "")
+		h.sendDeny(from, "")
 	}
 }
 
