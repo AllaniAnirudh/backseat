@@ -398,3 +398,44 @@ func mustRead(t *testing.T, path string) []byte {
 	}
 	return b
 }
+
+// TestApprovalFlushedOnLateEnroll proves a prompt detected before any
+// expert enrolled is forwarded when an expert later joins, instead of
+// sitting pending and invisible forever.
+func TestApprovalFlushedOnLateEnroll(t *testing.T) {
+	wsURL := startTestRelay(t)
+	secret, err := pairing.GenerateSecret()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Fake agent: prints the prompt immediately, before anyone enrolls.
+	harness := "sleep 2; printf 'Deploy to prod? [y/n] '; sleep 30\n"
+	h, err := host.New(host.Config{
+		RelayURL:  wsURL,
+		SessionID: sessionID,
+		Secret:    secret,
+		HostName:  "testhost",
+		Harness:   "echo",
+		AgentCmd:  []string{"sh", "-c", harness},
+		Decide:    func(protocol.ControlRequest) bool { return true },
+	})
+	if err != nil {
+		t.Fatalf("host.New: %v", err)
+	}
+	defer h.End("test cleanup")
+
+	// Wait until the host has detected the prompt with nobody to ask.
+	waitFor(t, 5*time.Second, func() bool { return h.PendingApprovalCount() > 0 }, "pending approval")
+
+	// Enroll late: the pending prompt must be flushed to the newcomer.
+	conn, keys := enrollExpert(t, wsURL, "late", secret)
+	reqMsg := readUntil(t, conn, 5*time.Second, protocol.TypeApprovalRequest)
+	var req protocol.ApprovalRequest
+	openPayload(t, reqMsg, keys.HostToExpert, &req)
+	if !strings.Contains(req.Prompt, "Deploy to prod?") {
+		t.Fatalf("bad prompt: %+v", req)
+	}
+	if req.ApprovalID == "" {
+		t.Fatalf("missing approval id: %+v", req)
+	}
+}

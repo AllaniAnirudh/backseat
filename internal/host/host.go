@@ -532,6 +532,43 @@ func (h *Host) onEnrollResponse(from string, pe protocol.PairingEnroll) {
 		Phase:     3,
 	}, from)
 	_ = h.sendTo(from, protocol.TypeSessionAnnounce, h.announce)
+	// A prompt may have been detected before anyone enrolled (or while a
+	// different expert held control). Flush pending, unexpired prompts to
+	// the newcomer so a waiting agent question is never silently missed.
+	h.forwardPendingApprovals(from)
+}
+
+// forwardPendingApprovals re-sends unexpired pending prompts to a newly
+// enrolled expert. Must be called without h.mu held.
+func (h *Host) forwardPendingApprovals(to string) {
+	now := time.Now()
+	h.mu.Lock()
+	if h.controller != "" && h.controller != to {
+		h.mu.Unlock()
+		return // prompts go to the controller only
+	}
+	var pending []*pendingApproval
+	for _, p := range h.approvals {
+		if !p.expired(now) {
+			pending = append(pending, p)
+		}
+	}
+	h.mu.Unlock()
+	for _, p := range pending {
+		_ = h.sendTo(to, protocol.TypeApprovalRequest, protocol.ApprovalRequest{
+			SessionID:    h.cfg.SessionID,
+			ApprovalID:   p.id,
+			Tool:         p.tool,
+			Summary:      p.prompt,
+			Prompt:       p.prompt,
+			ApproveLabel: "Approve",
+			DenyLabel:    "Deny",
+			ExpiresAt:    p.createdAt.Add(approvalTTL).Unix(),
+		})
+	}
+	if len(pending) > 0 {
+		h.event(fmt.Sprintf("forwarded %d pending approval(s) to %s", len(pending), to))
+	}
 }
 
 func (h *Host) failEnroll(name, reason string) {
@@ -936,6 +973,14 @@ func (h *Host) Controller() string {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.controller
+}
+
+// PendingApprovalCount reports how many approval prompts are waiting for
+// an answer. Used by tests to wait for prompt detection.
+func (h *Host) PendingApprovalCount() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return len(h.approvals)
 }
 
 // Pending reports the expert name awaiting a grant/deny decision.
