@@ -11,12 +11,16 @@
 // Control decisions (grant/deny/yield/kick/rewind confirm) are deliberately
 // NOT tools: the novice human confirms them out-of-band via
 // `backseat-mcp ctl`, which talks to the session over a filesystem-gated
-// unix socket. Human confirmation is enforced by the skill, not the server.
+// unix socket. Session creation is human-gated too: backseat-mcp prompts
+// the human on /dev/tty (which the agent has no access to) before minting
+// a session, so a prompt-injected agent can never create one on its own.
+// BACKSEAT_ASSUME_YES=1 bypasses that prompt (trusts the local console
+// user; for tests and headless runs).
 //
 // Usage:
 //
 //	backseat-mcp                       # stdio MCP server
-//	backseat-mcp ctl [--sock PATH] <grant|deny|yield|kick|end|confirm-restore|deny-restore|status> [args...]
+//	backseat-mcp ctl [--sock PATH] <grant [name]|deny|yield|kick|end|confirm-restore|deny-restore|status> [args...]
 //
 // Environment:
 //
@@ -24,13 +28,17 @@
 //	BACKSEAT_UI_BASE     public base URL of the expert web UI, for the invite link
 //	BACKSEAT_WORKDIR     exec/checkpoint directory (default: current directory)
 //	BACKSEAT_HOST_NAME   display name shown to the expert (default: agent)
-//	BACKSEAT_CTL_SOCK    control socket path (default: $TMPDIR/backseat-mcp-<pid>.sock)
+//	BACKSEAT_CTL_SOCK    control socket path (default: $TMPDIR/backseat-mcp-<32 random hex>.sock)
+//	BACKSEAT_ASSUME_YES  "1" answers the human-confirm prompts with yes (trusts
+//	                     the local console user; for tests/headless)
 package main
 
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -44,6 +52,75 @@ import (
 )
 
 var sess *mcphost.Session
+
+// humanConfirmer asks the human to confirm session creation. It defaults
+// to humanConfirmTTY; tests may swap it.
+var humanConfirmer = humanConfirmTTY
+
+// humanConfirmTimeout bounds how long the server waits on the human.
+const humanConfirmTimeout = 60 * time.Second
+
+// humanConfirmTTY prompts the human on /dev/tty and reads the answer
+// there. The agent has no TTY, so a prompt-injected agent cannot forge the
+// answer; only the human at the console can. It fails closed: no TTY, a
+// denied answer, or a timeout all refuse.
+//
+// BACKSEAT_ASSUME_YES=1 bypasses the prompt. It trusts whoever launched
+// the server (the local console user); meant for tests and headless runs.
+func humanConfirmTTY(prompt string) (bool, error) {
+	if os.Getenv("BACKSEAT_ASSUME_YES") == "1" {
+		return true, nil
+	}
+	tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
+	if err != nil {
+		return false, fmt.Errorf("backseat: no controlling terminal for human confirmation: %w", err)
+	}
+	defer tty.Close()
+	fmt.Fprintf(tty, "%s ", prompt)
+	lineCh := make(chan string, 1)
+	go func() {
+		line, _ := bufio.NewReader(tty).ReadString('\n')
+		lineCh <- line
+	}()
+	select {
+	case line := <-lineCh:
+		switch strings.ToLower(strings.TrimSpace(line)) {
+		case "y", "yes":
+			return true, nil
+		default:
+			return false, nil
+		}
+	case <-time.After(humanConfirmTimeout):
+		return false, errors.New("backseat: human confirmation timed out after 60s")
+	}
+}
+
+// confirmSessionCreation gates session creation on the human. It runs
+// before anything is minted: a denial means no session exists.
+func confirmSessionCreation(label string) error {
+	if label == "" {
+		label = "untitled"
+	}
+	ok, err := humanConfirmer(fmt.Sprintf(
+		"Backseat: create session '%s'? The invite link and code will be shown to the agent. [y/N]", label))
+	if err != nil {
+		return fmt.Errorf("human confirmation: %w", err)
+	}
+	if !ok {
+		return errors.New("backseat: session creation denied by the human")
+	}
+	return nil
+}
+
+// defaultCtlSock builds an unpredictable socket name: 32 random hex
+// chars, never the PID, so a local peer cannot guess it.
+func defaultCtlSock() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return filepath.Join(os.TempDir(), fmt.Sprintf("backseat-mcp-%d.sock", os.Getpid()))
+	}
+	return filepath.Join(os.TempDir(), fmt.Sprintf("backseat-mcp-%x.sock", b))
+}
 
 func env(key, def string) string {
 	if v := os.Getenv(key); v != "" {
@@ -86,6 +163,11 @@ func handleCreateSession(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 	if sess != nil {
 		return toolError(fmt.Errorf("session already created in this process"))
 	}
+	label := req.GetString("label", "")
+	// Human gate first: no confirmation means no session is minted.
+	if err := confirmSessionCreation(label); err != nil {
+		return toolError(err)
+	}
 	workDir := env("BACKSEAT_WORKDIR", "")
 	if workDir == "" {
 		var err error
@@ -95,11 +177,12 @@ func handleCreateSession(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 		}
 	}
 	s, err := mcphost.New(mcphost.Config{
-		RelayURL: env("BACKSEAT_RELAY_URL", "ws://127.0.0.1:8080/ws"),
-		UIBase:   env("BACKSEAT_UI_BASE", "http://localhost:8081"),
-		HostName: env("BACKSEAT_HOST_NAME", "agent"),
-		Harness:  "mcp",
-		WorkDir:  workDir,
+		RelayURL:     env("BACKSEAT_RELAY_URL", "ws://127.0.0.1:8080/ws"),
+		UIBase:       env("BACKSEAT_UI_BASE", "http://localhost:8081"),
+		HostName:     env("BACKSEAT_HOST_NAME", "agent"),
+		Harness:      "mcp",
+		WorkDir:      workDir,
+		HumanConfirm: humanConfirmer,
 		OnEvent: func(ev string) {
 			fmt.Fprintf(os.Stderr, "backseat: %s\n", ev)
 		},
@@ -107,23 +190,28 @@ func handleCreateSession(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 	if err != nil {
 		return toolError(err)
 	}
-	sockPath := env("BACKSEAT_CTL_SOCK", filepath.Join(os.TempDir(),
-		fmt.Sprintf("backseat-mcp-%d.sock", os.Getpid())))
+	sockPath := env("BACKSEAT_CTL_SOCK", "")
+	if sockPath == "" {
+		sockPath = defaultCtlSock()
+	}
 	go func() {
 		if err := s.ServeControl(sockPath); err != nil {
 			fmt.Fprintf(os.Stderr, "backseat: control socket: %v\n", err)
 		}
 	}()
 	sess = s
+	// The control socket path is deliberately NOT in the tool result: the
+	// human reads it from the server's stderr. Printing it here would hand
+	// it to the agent.
 	return toolJSON(map[string]any{
-		"session_id":     s.SessionID(),
-		"expert_url":     s.InviteURL(),
-		"expert_code":    s.InviteCode(),
-		"control_socket": sockPath,
-		"label":          req.GetString("label", ""),
+		"session_id":  s.SessionID(),
+		"expert_url":  s.InviteURL(),
+		"expert_code": s.InviteCode(),
+		"label":       label,
 		"note": "Share expert_url with the human expert. Control requests and " +
 			"rewind requests need the novice's confirmation via " +
-			"`backseat-mcp ctl --sock " + sockPath + " <command>`.",
+			"`backseat-mcp ctl --sock <socket> <command>`; the socket path is " +
+			"printed on the server's stderr at startup.",
 	})
 }
 
@@ -141,8 +229,10 @@ func handlePublishEvent(ctx context.Context, req mcp.CallToolRequest) (*mcp.Call
 		return toolError(fmt.Errorf("text: %w", err))
 	}
 	fields := map[string]any{}
-	if m := strMap(req.GetArguments()["meta"]); len(m) > 0 {
-		for k, v := range m {
+	// Mask structurally BEFORE stringifying: nested maps stay maps for
+	// the masker, and secret-looking keys redact wholesale.
+	if m, ok := req.GetArguments()["meta"].(map[string]any); ok && len(m) > 0 {
+		for k, v := range strMap(mcphost.MaskSecretFields(m)) {
 			fields[k] = v
 		}
 	}
@@ -221,7 +311,7 @@ func runMCPServer() error {
 	srv := server.NewMCPServer("backseat", "0.3.0")
 
 	srv.AddTool(mcp.NewTool("backseat__create_session",
-		mcp.WithDescription("Create one expert-collaboration session. Returns the expert invite URL and the local control socket path. One session per process."),
+		mcp.WithDescription("Create one expert-collaboration session. Asks the human for confirmation first; returns the expert invite URL and code. One session per process."),
 		mcp.WithString("label", mcp.Description("Human-readable label for the session")),
 	), handleCreateSession)
 
@@ -273,7 +363,7 @@ func runCtl(args []string) error {
 		return fmt.Errorf("control socket unknown: pass --sock PATH or set BACKSEAT_CTL_SOCK")
 	}
 	if len(rest) == 0 {
-		return fmt.Errorf("usage: backseat-mcp ctl [--sock PATH] <grant|deny|yield|kick|end|confirm-restore|deny-restore|status> [args...]")
+		return fmt.Errorf("usage: backseat-mcp ctl [--sock PATH] <grant [name]|deny|yield|kick|end|confirm-restore|deny-restore|status> [args...]")
 	}
 	conn, err := net.Dial("unix", sockPath)
 	if err != nil {
