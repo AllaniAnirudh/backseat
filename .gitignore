@@ -10,9 +10,9 @@
 /dist/
 
 # Build artifacts
-backseat-host
-backseat-relay
-backseat-expert
+/backseat-host
+/backseat-relay
+/backseat-expert
 
 # Go workspace
 go.work

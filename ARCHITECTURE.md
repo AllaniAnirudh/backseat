@@ -4,7 +4,7 @@
 
 **Host daemon** (`cmd/backseat-host`, `internal/pty`). Runs on the novice's machine. Wraps the agent command in a PTY via creack/pty, announces the session to the relay, prints the one-time invite link, and enforces control state locally: only the current controller's input reaches the PTY. The novice approves or denies control requests by typing `grant` or `deny` in the host terminal, and can kill the session at any time with `end`.
 
-**Relay server** (`cmd/backseat-relay`). Self-hostable WebSocket relay. Rooms are keyed by session id; the relay forwards opaque JSON envelopes between host and experts and keeps no other state. It never sees plaintext: after pairing completes, payloads are end-to-end encrypted between host and expert, so a hostile or curious relay operator learns nothing about the session contents.
+**Relay server** (`cmd/backseat-relay`, `internal/relay`). Self-hostable WebSocket relay. Rooms are keyed by session id; the relay forwards JSON envelopes between host and experts, gates joins on the invite secret, and tracks the controller so only the current controller's input reaches the host. End-to-end encryption of payloads is the v0.3 target; in v0.1 envelopes travel in plaintext, so self-host the relay. See "v0.1 implementation notes".
 
 **Expert client** (`cmd/backseat-expert`). Web UI served over HTTP. Shows the live terminal via xterm.js, a transcript pane (planned), a Request control button, and Approve/Deny buttons for forwarded agent tool calls. The invite secret stays in the URL fragment, so it never reaches any server in an HTTP request.
 
@@ -82,16 +82,28 @@ Raw terminal sharing already exists (tmate). Backseat earns its place with three
 
 Run on one machine with two terminals (or two machines on a LAN):
 
-1. Terminal 1: `go run ./cmd/backseat-relay` (listens on :8080).
-2. Terminal 2: `go run ./cmd/backseat-expert` (listens on :8081).
-3. Terminal 3: `go run ./cmd/backseat-host --agent "claude" --relay ws://localhost:8080/ws --url http://localhost:8081`. Copy the printed invite link.
+1. Terminal 1: `go run ./cmd/backseat-relay --addr :8080`.
+2. Terminal 2: `go run ./cmd/backseat-expert --port :8081 --relay-ws ws://localhost:8080/ws`.
+3. Terminal 3: `go run ./cmd/backseat-host --relay ws://localhost:8080 --ui http://localhost:8081 -- claude`. Copy the printed invite link.
 4. Open the link in a browser. Confirm the live terminal mirrors the agent.
 5. Click Request control. In the host terminal, type `grant`.
 6. Type into the browser terminal. Confirm the keystrokes drive the agent on the host.
-7. Trigger an agent tool call that needs approval. Confirm the Approve/Deny buttons appear and the decision takes effect.
+7. Agent tool approval forwarding: deferred to v0.3 (no Approve/Deny buttons in v0.1).
 8. In the host terminal, type `end`. Confirm the browser shows the session ended.
 
-Demo complete checklist: invite link works, terminal mirrors, control request plus novice grant, expert drives the agent, approval forwarding works, clean teardown.
+Demo complete checklist: invite link works, terminal mirrors, control request plus novice grant, expert drives the agent, clean teardown.
+
+## v0.1 implementation notes
+
+What actually shipped, and where it deliberately diverges from the spec above.
+
+- **Pairing: secret presentation, not the HMAC ceremony.** The host generates a 32-byte secret, puts `secret_hash` (hex SHA-256) in `session_announce`, and builds the invite as `{base}/?session={id}#secret={b64url}` (the expert UI also accepts the spec's `/join/{id}` path form). The expert presents the secret inside its first `room_join` payload; the relay verifies it in constant time against the stored hash. Wrong secret gets a `bad_secret` error and a closed connection; the secret never appears in relay logs. The two-phase HMAC enrollment and HKDF key derivation from the spec are deferred to v0.3 alongside E2E encryption.
+- **Relay is trusted in v0.1.** Envelopes are plaintext JSON on the wire. The "untrusted relay" claims in this doc are the target state for v0.3, not current behavior. Self-host the relay.
+- **Control is enforced twice.** The host daemon is authoritative (expert `term_input` is applied to the PTY only while an expert holds control); the relay also tracks the controller per room and drops `term_input` from anyone else. `control_yield` from either side returns control to the novice. The host auto-denies a second concurrent request while one is pending.
+- **Host stdin is a command console, not a PTY keyboard.** `grant`, `deny [reason]`, `yield`, `kick <name> [reason]`, `end`, `help`. Novice typing directly into the agent's PTY is deferred.
+- **Join race.** The host announces asynchronously, so an instant join can hit `no_session`. The expert UI retries the join a few times on `no_session`; anything else fails fast.
+- **Relay robustness.** The write pump drains queued envelopes before the socket closes, so `session_end` is never lost on teardown; `enqueue` is safe against concurrently closed peers; `dropRoom` clears room state.
+- **Single use is approximated.** Invites expire after 10 minutes; strict single-use (burn on first join) is not yet enforced.
 
 ## Roadmap
 

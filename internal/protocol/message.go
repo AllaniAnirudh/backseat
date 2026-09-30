@@ -13,11 +13,13 @@ const (
 	TypeSessionAnnounce   = "session_announce"
 	TypePairingInvite     = "pairing_invite"
 	TypePairingEnroll     = "pairing_enroll"
+	TypeRoomJoin          = "room_join"
 	TypeControlRequest    = "control_request"
 	TypeControlGrant      = "control_grant"
 	TypeControlDeny       = "control_deny"
 	TypeControlYield      = "control_yield"
 	TypeControlForce      = "control_force"
+	TypePeerKick          = "peer_kick"
 	TypeTermInput         = "term_input"
 	TypeTermOutput        = "term_output"
 	TypeTranscriptEvent   = "transcript_event"
@@ -26,6 +28,7 @@ const (
 	TypeCheckpointCreate  = "checkpoint_create"
 	TypeCheckpointRestore = "checkpoint_restore"
 	TypeSessionEnd        = "session_end"
+	TypeError             = "error"
 )
 
 // Message is the envelope for every protocol frame.
@@ -51,11 +54,39 @@ func (m Message) Decode(v any) error {
 }
 
 // SessionAnnounce is sent by the host when a session goes live.
+// SecretHash is hex(SHA-256(secret)): the relay gates room joins on it
+// without ever seeing the secret itself.
 type SessionAnnounce struct {
+	SessionID  string `json:"session_id"`
+	HostName   string `json:"host_name"`
+	Harness    string `json:"harness"` // e.g. "claude", "copilot", "opencode", "aider"
+	AgentCmd   string `json:"agent_cmd"`
+	SecretHash string `json:"secret_hash"`
+	ExpiresAt  int64  `json:"expires_at"` // unix seconds; invite TTL
+}
+
+// RoomJoin is the first envelope an expert sends. The invite secret travels
+// inside the payload, never in the URL path or query string.
+type RoomJoin struct {
+	SessionID  string `json:"session_id"`
+	ExpertName string `json:"expert_name"`
+	Secret     string `json:"secret"` // base64url-encoded 32-byte invite secret
+}
+
+// PeerKick drops one expert from the room. Sent by the host; enforced by
+// the relay.
+type PeerKick struct {
+	SessionID  string `json:"session_id"`
+	ExpertName string `json:"expert_name"`
+	Reason     string `json:"reason,omitempty"`
+}
+
+// Error reports a rejected request (bad secret, unknown session, kicked).
+// The relay closes the connection right after sending it.
+type Error struct {
 	SessionID string `json:"session_id"`
-	HostName  string `json:"host_name"`
-	Harness   string `json:"harness"` // e.g. "claude", "copilot", "opencode", "aider"
-	AgentCmd  string `json:"agent_cmd"`
+	Code      string `json:"code"` // e.g. "bad_secret", "no_session", "expired", "kicked"
+	Message   string `json:"message,omitempty"`
 }
 
 // PairingInvite carries a fresh one-time invitation for an expert.

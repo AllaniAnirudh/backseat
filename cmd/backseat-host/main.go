@@ -1,12 +1,12 @@
 // Command backseat-host runs on the novice's machine. It wraps an agent
 // command in a PTY, announces the session to the relay, prints a one-time
-// invite link, and lets the novice approve or deny expert control requests.
+// invite link, and lets the novice approve or deny expert control requests
+// from the console: grant, deny, yield, kick, end.
 package main
 
 import (
 	"bufio"
 	"crypto/rand"
-	"encoding/base64"
 	"encoding/hex"
 	"flag"
 	"fmt"
@@ -14,175 +14,111 @@ import (
 	"net/url"
 	"os"
 	"strings"
-	"time"
 
-	"github.com/gorilla/websocket"
-
+	"github.com/AllaniAnirudh/backseat/internal/host"
 	"github.com/AllaniAnirudh/backseat/internal/pairing"
-	"github.com/AllaniAnirudh/backseat/internal/protocol"
-	bpty "github.com/AllaniAnirudh/backseat/internal/pty"
 )
 
-func newID() string {
+func newSessionID() string {
 	b := make([]byte, 8)
 	rand.Read(b)
 	return hex.EncodeToString(b)
 }
 
-func send(conn *websocket.Conn, msgType string, payload any) error {
-	msg, err := protocol.New(msgType, newID(), time.Now().UnixMilli(), payload)
-	if err != nil {
-		return err
-	}
-	return conn.WriteJSON(msg)
-}
-
 func main() {
-	agentCmd := flag.String("agent", "claude", "agent command to run, e.g. \"claude\" or \"copilot --allow-all\"")
-	relay := flag.String("relay", "ws://localhost:8080/ws", "relay WebSocket URL")
-	name := flag.String("name", "", "display name shown to the expert")
-	base := flag.String("url", "http://localhost:8081", "public base URL used to build the invite link")
+	relayURL := flag.String("relay", "ws://localhost:8080", "relay WebSocket URL (path /ws is added when missing)")
+	uiBase := flag.String("ui", "http://localhost:8081", "public base URL of the expert web UI, used to build the invite link")
+	name := flag.String("name", "novice", "display name shown to the expert")
+	harness := flag.String("harness", "", "harness label shown to the expert (defaults to the agent command name)")
 	flag.Parse()
 
-	parts := strings.Fields(*agentCmd)
-	if len(parts) == 0 {
-		log.Fatal("empty agent command")
+	agentCmd := flag.Args()
+	if len(agentCmd) == 0 {
+		log.Fatal("usage: backseat-host [--relay URL] [--ui URL] -- <agent command...>")
+	}
+	if *harness == "" {
+		*harness = agentCmd[0]
 	}
 
-	sessionID := newID()
+	u, err := url.Parse(*relayURL)
+	if err != nil {
+		log.Fatalf("relay url: %v", err)
+	}
+	if u.Path == "" || u.Path == "/" {
+		u.Path = "/ws"
+	}
+
+	sessionID := newSessionID()
 	secret, err := pairing.GenerateSecret()
 	if err != nil {
 		log.Fatalf("secret: %v", err)
 	}
-	invite := pairing.InviteURL(*base, sessionID, secret)
+	invite := pairing.InviteURL(*uiBase, sessionID, secret)
 
 	fmt.Println("Backseat session starting.")
-	fmt.Println("Agent:", *agentCmd)
+	fmt.Println("Agent:", strings.Join(agentCmd, " "))
 	fmt.Println()
 	fmt.Println("Share this one-time link with your expert (expires in 10 minutes):")
 	fmt.Println("  " + invite)
 	fmt.Println()
-	fmt.Println("Type 'grant' to approve a control request, 'deny' to refuse, 'end' to stop.")
+	fmt.Println("Commands: grant | deny [reason] | yield | kick <name> [reason] | end")
 
-	sess, err := bpty.Start(parts[0], parts[1:]...)
-	if err != nil {
-		log.Fatalf("pty: %v", err)
-	}
-	defer sess.Close()
-
-	u, err := url.Parse(*relay)
-	if err != nil {
-		log.Fatalf("relay url: %v", err)
-	}
-	conn, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
-	if err != nil {
-		log.Fatalf("dial relay: %v", err)
-	}
-	defer conn.Close()
-
-	hostName := *name
-	if hostName == "" {
-		hostName = "novice"
-	}
-	harness := parts[0]
-	if err := send(conn, protocol.TypeSessionAnnounce, protocol.SessionAnnounce{
+	h, err := host.New(host.Config{
+		RelayURL:  u.String(),
 		SessionID: sessionID,
-		HostName:  hostName,
-		Harness:   harness,
-		AgentCmd:  *agentCmd,
-	}); err != nil {
-		log.Fatalf("announce: %v", err)
+		Secret:    secret,
+		HostName:  *name,
+		Harness:   *harness,
+		AgentCmd:  agentCmd,
+		// Decide nil: control requests wait for a console grant/deny.
+		OnOutput: func(b []byte) { os.Stdout.Write(b) },
+		OnEvent:  func(s string) { fmt.Println("\n[backseat] " + s) },
+	})
+	if err != nil {
+		log.Fatalf("host: %v", err)
 	}
 
-	controller := "host" // "host" or expert name
-	pendingExpert := ""
-
-	// PTY output -> relay broadcast.
-	go func() {
-		ch := sess.Subscribe()
-		defer sess.Unsubscribe(ch)
-		for b := range ch {
-			_ = send(conn, protocol.TypeTermOutput, protocol.TermOutput{
-				SessionID: sessionID,
-				Data:      base64.StdEncoding.EncodeToString(b),
-			})
-		}
-	}()
-
-	// Relay -> local: route input and control messages.
-	go func() {
-		for {
-			var msg protocol.Message
-			if err := conn.ReadJSON(&msg); err != nil {
-				return
-			}
-			switch msg.Type {
-			case protocol.TypeControlRequest:
-				var p protocol.ControlRequest
-				if err := msg.Decode(&p); err != nil {
-					continue
-				}
-				pendingExpert = p.ExpertName
-				fmt.Printf("\n[backseat] %s requests control", p.ExpertName)
-				if p.Note != "" {
-					fmt.Printf(" (%s)", p.Note)
-				}
-				fmt.Print(". Type 'grant' or 'deny': ")
-			case protocol.TypeControlYield:
-				controller = "host"
-				fmt.Println("\n[backseat] control returned to you.")
-			case protocol.TypeTermInput:
-				if controller == "host" {
-					continue // nobody else may drive while we hold control
-				}
-				var p protocol.TermInput
-				if err := msg.Decode(&p); err != nil {
-					continue
-				}
-				raw, err := base64.StdEncoding.DecodeString(p.Data)
-				if err != nil {
-					continue
-				}
-				sess.Write(raw)
-			case protocol.TypeSessionEnd:
-				fmt.Println("\n[backseat] session ended by peer.")
-				sess.Close()
-				os.Exit(0)
-			}
-		}
-	}()
-
-	// Novice console: grant, deny, end.
 	scanner := bufio.NewScanner(os.Stdin)
 	for scanner.Scan() {
-		switch strings.TrimSpace(strings.ToLower(scanner.Text())) {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		cmd, rest, _ := strings.Cut(line, " ")
+		rest = strings.TrimSpace(rest)
+		switch strings.ToLower(cmd) {
 		case "grant":
-			if pendingExpert == "" {
-				fmt.Println("[backseat] no pending request.")
-				continue
+			if err := h.Grant(); err != nil {
+				fmt.Println("[backseat]", err)
 			}
-			controller = pendingExpert
-			_ = send(conn, protocol.TypeControlGrant, protocol.ControlGrant{
-				SessionID: sessionID, ExpertName: pendingExpert,
-			})
-			fmt.Printf("[backseat] control handed to %s. Type 'end' to stop the session.\n", pendingExpert)
-			pendingExpert = ""
 		case "deny":
-			if pendingExpert == "" {
-				fmt.Println("[backseat] no pending request.")
+			if err := h.Deny(rest); err != nil {
+				fmt.Println("[backseat]", err)
+			} else {
+				fmt.Println("[backseat] request denied.")
+			}
+		case "yield":
+			h.Yield()
+		case "kick":
+			who, reason, _ := strings.Cut(rest, " ")
+			if who == "" {
+				fmt.Println("[backseat] usage: kick <name> [reason]")
 				continue
 			}
-			_ = send(conn, protocol.TypeControlDeny, protocol.ControlDeny{
-				SessionID: sessionID, ExpertName: pendingExpert,
-			})
-			pendingExpert = ""
+			h.Kick(who, strings.TrimSpace(reason))
 		case "end":
-			_ = send(conn, protocol.TypeSessionEnd, protocol.SessionEnd{SessionID: sessionID})
-			sess.Close()
+			h.End("novice ended the session")
+			fmt.Println("[backseat] session ended.")
 			return
+		case "help":
+			fmt.Println("[backseat] commands: grant | deny [reason] | yield | kick <name> [reason] | end")
+		default:
+			fmt.Println("[backseat] unknown command. Type 'help'.")
 		}
 	}
-
-	sess.Wait()
-	_ = send(conn, protocol.TypeSessionEnd, protocol.SessionEnd{SessionID: sessionID, Reason: "agent exited"})
+	// Stdin closed: keep the session alive until the agent exits or the
+	// relay drops it.
+	<-h.Done()
+	h.Wait()
+	fmt.Println("[backseat] session over.")
 }

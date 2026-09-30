@@ -10,6 +10,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -38,12 +39,12 @@ func GenerateSecret() ([SecretLen]byte, error) {
 }
 
 // InviteURL builds the one-time link the novice sends to the expert.
-// The secret lives only in the URL fragment so it never reaches the relay
-// server in an HTTP request.
+// The session id is a plain query param; the secret lives only in the URL
+// fragment so it never reaches any server in an HTTP request.
 func InviteURL(base, sessionID string, secret [SecretLen]byte) string {
 	enc := base64.RawURLEncoding.EncodeToString(secret[:])
 	base = strings.TrimRight(base, "/")
-	return fmt.Sprintf("%s/join/%s#secret=%s", base, sessionID, enc)
+	return fmt.Sprintf("%s/?session=%s#secret=%s", base, sessionID, enc)
 }
 
 // ParseSecret extracts the invite secret from a URL fragment of the form
@@ -66,6 +67,30 @@ func ParseSecret(fragment string) ([SecretLen]byte, error) {
 		}
 	}
 	return s, errors.New("pairing: no secret in fragment")
+}
+
+// Verifier returns hex(SHA-256(secret)). The host puts it in the session
+// announcement so the relay can gate room joins without ever seeing the
+// secret itself.
+func Verifier(secret [SecretLen]byte) string {
+	sum := sha256.Sum256(secret[:])
+	return hex.EncodeToString(sum[:])
+}
+
+// CheckSecret compares a presented base64url secret against a verifier in
+// constant time. Used by the relay to gate room joins.
+func CheckSecret(presentedB64URL, verifier string) bool {
+	raw, err := base64.RawURLEncoding.DecodeString(presentedB64URL)
+	if err != nil || len(raw) != SecretLen {
+		return false
+	}
+	var s [SecretLen]byte
+	copy(s[:], raw)
+	a, b := Verifier(s), verifier
+	if len(a) != len(b) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
 }
 
 // NewChallenge returns a fresh random challenge for enrollment phase 1.
