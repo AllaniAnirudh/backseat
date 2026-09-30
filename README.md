@@ -2,7 +2,34 @@
 
 ![status](https://img.shields.io/badge/status-early%20MVP-orange)
 
+![Expert driving a session in the browser](docs/images/expert-driving.png)
+
+*Verified with a real headless-Chromium click-through: join as viewer, request control, host grants, typed input echoed back through the PTY, yield. Zero JS errors.*
+
 Backseat lets an expert take over someone else's live AI coding agent session. The novice runs one command, shares a one-time link, and the expert opens it in a browser: they see the terminal, request control, and once the novice approves, they drive the agent directly on the novice's machine. It works with any CLI harness (Copilot CLI, Claude Code, OpenCode, Aider) because it captures the terminal, not each agent's private protocol.
+
+## Status: v0.1
+
+Works end to end on localhost: three terminals, one browser. `go build ./...`, `go vet ./...`, and `go test ./...` are green, including an in-process end-to-end test covering join, bad-secret rejection, control grant, driven input echoed back, input gating after yield, and clean teardown.
+
+### What v0.1 does
+
+- Captures any agent command in a PTY and streams the output to the host's own terminal and to connected viewers.
+- One-time invite links (`{ui}/?session={id}#secret={...}`): 10-minute expiry, the secret stays in the URL fragment so it never hits a server log, verified in constant time against a stored hash. A wrong secret gets an error and a closed connection; the secret is never logged.
+- Control handoff with novice consent: request, grant, deny, yield from either side, plus kick and end. Exactly one controller at a time, enforced by the host daemon and double-checked by the relay.
+- Host console commands: `grant`, `deny [reason]`, `yield`, `kick <name> [reason]`, `end`, `help`.
+- Self-contained expert UI: xterm.js is vendored into the `backseat-expert` binary, so the page works with no CDN or internet access.
+
+### Honest limitation
+
+The v0.1 relay routes plaintext envelopes, so run your own relay or one you trust. End-to-end payload encryption is on the v0.3 roadmap. See SECURITY.md for the full scope.
+
+### Deferred (see ARCHITECTURE.md roadmap)
+
+- End-to-end payload encryption from pairing keys (v0.3).
+- Transcript adapters, approval forwarding with one-tap buttons, checkpoints and rewind (v0.2/v0.3).
+- Novice typing directly into the PTY: in v0.1 the host stdin is a command console only.
+- NAT traversal / direct transport (v0.4).
 
 ## How it works
 
@@ -55,25 +82,9 @@ go run ./cmd/backseat-host --relay ws://localhost:8080 --ui http://localhost:808
 
 Open the printed link in a browser. The secret stays in the URL fragment, so it never hits a server log. Click Request control, type `grant` in the host terminal, and type into the browser terminal: your keystrokes drive the agent. Host console commands: `grant`, `deny [reason]`, `yield`, `kick <name> [reason]`, `end`, `help`.
 
-## Status
-
-v0.1 works end to end on localhost (three terminals, one browser).
-
-Done:
-- PTY capture of any agent command, output streamed to host stdout and to viewers.
-- One-time invite links: `{ui}/?session={id}#secret={base64url}`, 10-minute expiry, secret verified in constant time against a stored hash. Wrong secret gets an error and a closed connection, and the attempt is never logged with the secret.
-- Control handoff with novice consent: request, grant, deny, yield from either side, kick, end. Exactly one controller at a time, enforced by the host daemon and double-checked by the relay.
-- In-process end-to-end test (`go test ./...`) covering join, bad-secret rejection, control grant, driven input echoed back, input gating after yield, and clean teardown.
-
-Deferred (see ARCHITECTURE.md roadmap):
-- End-to-end payload encryption from pairing keys (v0.3). The v0.1 relay routes plaintext envelopes: self-host it.
-- Transcript adapters, approval forwarding with one-tap buttons, checkpoints and rewind (v0.2/v0.3).
-- Novice typing directly into the PTY: in v0.1 the host stdin is a command console only.
-- NAT traversal / direct transport (v0.4).
-
 ## Contributing
 
-Issues and PRs welcome. Keep changes small and focused, add tests for protocol and pairing changes, and do not add per-harness private protocol integrations: the PTY plus transcript adapters is the whole strategy.
+See CONTRIBUTING.md. Issues and PRs welcome. Keep changes small and focused, add tests for protocol and pairing changes, and do not add per-harness private protocol integrations: the PTY plus transcript adapters is the whole strategy.
 
 ## License
 

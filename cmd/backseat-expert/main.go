@@ -4,11 +4,15 @@
 package main
 
 import (
+	"embed"
 	"flag"
 	"log"
 	"net/http"
 	"strings"
 )
+
+//go:embed static
+var staticFS embed.FS
 
 const pageTemplate = `<!doctype html>
 <html>
@@ -16,7 +20,7 @@ const pageTemplate = `<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Backseat</title>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.5.0/css/xterm.min.css">
+<link rel="stylesheet" href="/static/xterm.css">
 <style>
 body { background: #0d1117; color: #c9d1d9; font-family: system-ui, sans-serif; margin: 0; }
 #bar { display: flex; gap: 12px; align-items: center; padding: 10px 16px; border-bottom: 1px solid #30363d; flex-wrap: wrap; }
@@ -37,7 +41,7 @@ button:disabled { background: #30363d; cursor: default; }
   <button id="yield" disabled>Yield control</button>
 </div>
 <div id="term"></div>
-<script src="https://cdn.jsdelivr.net/npm/xterm@5.5.0/lib/xterm.min.js"></script>
+<script src="/static/xterm.js"></script>
 <script>
 (function () {
   var q = new URLSearchParams(location.search);
@@ -182,6 +186,7 @@ func main() {
 	}
 	mux.HandleFunc("/", serve)
 	mux.HandleFunc("/join/", serve)
+	mux.Handle("/static/", http.FileServer(http.FS(staticFS)))
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Write([]byte("ok"))
 	})
