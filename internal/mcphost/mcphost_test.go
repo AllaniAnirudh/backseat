@@ -9,6 +9,7 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -533,9 +534,8 @@ func TestExecControllerOnlyAndNoviceVisible(t *testing.T) {
 		t.Errorf("exec run missing from novice inbox")
 	}
 
-	// Not the controller anymore: the request is dropped, no output comes
-	// back. The expect-none read is last: a read timeout permanently poisons
-	// a gorilla websocket conn for further reads.
+	// Not the controller anymore: the request is answered with an error,
+	// never silence. The expect-last read is a normal read now.
 	s.Yield()
 	readUntil(t, conn, 5*time.Second, protocol.TypeControlYield)
 	sendEncrypted(t, conn, keys.ExpertToHost, "alice", protocol.TypeExecRequest, protocol.ExecRequest{
@@ -543,7 +543,12 @@ func TestExecControllerOnlyAndNoviceVisible(t *testing.T) {
 		ID:        "e2",
 		Command:   "echo should-not-run",
 	})
-	expectNone(t, conn, 500*time.Millisecond, "exec_output for non-controller")
+	errMsg := readUntil(t, conn, 5*time.Second, protocol.TypeExecOutput)
+	var errout protocol.ExecOutput
+	openPayload(t, errMsg, keys.HostToExpert, &errout)
+	if errout.ID != "e2" || errout.ExitCode != -1 || !strings.Contains(errout.Stderr, "not the controller") {
+		t.Errorf("bad non-controller exec output: %+v", errout)
+	}
 }
 
 func TestCheckpointAndRestoreFlow(t *testing.T) {
@@ -605,5 +610,357 @@ func TestCheckpointAndRestoreFlow(t *testing.T) {
 	}
 	if !restoredOK {
 		t.Error("restored event never arrived")
+	}
+}
+
+// TestHumanConfirmDenyPath injects a refusing confirmer: the control
+// request must clear and the expert must get a control_deny. Control is
+// never granted on a deny.
+func TestHumanConfirmDenyPath(t *testing.T) {
+	wsURL := startTestRelay(t)
+	s, secret := newTestSession(t, wsURL, func(c *Config) {
+		c.HumanConfirm = func(prompt string) (bool, error) {
+			if !strings.Contains(prompt, "alice") {
+				t.Errorf("prompt %q does not name the requester", prompt)
+			}
+			return false, nil
+		}
+	})
+
+	conn, keys := enrollExpert(t, wsURL, s.SessionID(), "alice", secret)
+	defer conn.Close()
+	sendEncrypted(t, conn, keys.ExpertToHost, "alice", protocol.TypeControlRequest, protocol.ControlRequest{
+		SessionID:  s.SessionID(),
+		ExpertName: "alice",
+	})
+	// The confirmer denies: the expert gets a control_deny.
+	denyMsg := readUntil(t, conn, 5*time.Second, protocol.TypeControlDeny)
+	var cd protocol.ControlDeny
+	openPayload(t, denyMsg, keys.HostToExpert, &cd)
+	if cd.ExpertName != "alice" {
+		t.Errorf("deny for %q, want alice", cd.ExpertName)
+	}
+	if s.PendingControl() != "" {
+		t.Errorf("pending = %q after human deny, want empty", s.PendingControl())
+	}
+	if s.Controller() != "" {
+		t.Errorf("controller = %q after deny, want empty", s.Controller())
+	}
+}
+
+// TestHumanConfirmGrantPath injects an approving confirmer: the request
+// resolves to a grant without any manual Grant() call.
+func TestHumanConfirmGrantPath(t *testing.T) {
+	wsURL := startTestRelay(t)
+	s, secret := newTestSession(t, wsURL, func(c *Config) {
+		c.HumanConfirm = func(prompt string) (bool, error) { return true, nil }
+	})
+
+	conn, keys := enrollExpert(t, wsURL, s.SessionID(), "alice", secret)
+	defer conn.Close()
+	sendEncrypted(t, conn, keys.ExpertToHost, "alice", protocol.TypeControlRequest, protocol.ControlRequest{
+		SessionID:  s.SessionID(),
+		ExpertName: "alice",
+	})
+	readUntil(t, conn, 5*time.Second, protocol.TypeControlGrant)
+	deadline := time.Now().Add(3 * time.Second)
+	for s.Controller() == "" && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if s.Controller() != "alice" {
+		t.Errorf("controller = %q, want alice", s.Controller())
+	}
+}
+
+// TestControlRequestUsesMsgFrom parks the request under the relay-stamped
+// sender, never the payload's ExpertName. A payload name that disagrees
+// with the sender is dropped outright.
+func TestControlRequestUsesMsgFrom(t *testing.T) {
+	wsURL := startTestRelay(t)
+	s, secret := newTestSession(t, wsURL, nil)
+
+	conn, keys := enrollExpert(t, wsURL, s.SessionID(), "alice", secret)
+	defer conn.Close()
+
+	// Spoofed payload name: must not park anything.
+	sendEncrypted(t, conn, keys.ExpertToHost, "alice", protocol.TypeControlRequest, protocol.ControlRequest{
+		SessionID:  s.SessionID(),
+		ExpertName: "mallory",
+	})
+	time.Sleep(300 * time.Millisecond)
+	if got := s.PendingControl(); got != "" {
+		t.Fatalf("pending = %q: spoofed payload name must not park a request", got)
+	}
+
+	// Honest payload: parks under the stamped sender.
+	sendEncrypted(t, conn, keys.ExpertToHost, "alice", protocol.TypeControlRequest, protocol.ControlRequest{
+		SessionID:  s.SessionID(),
+		ExpertName: "alice",
+	})
+	deadline := time.Now().Add(3 * time.Second)
+	for s.PendingControl() == "" && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if s.PendingControl() != "alice" {
+		t.Fatalf("pending = %q, want alice", s.PendingControl())
+	}
+}
+
+// TestApprovalResponseBridging answers a forwarded prompt with the v0.2
+// approval_response shape (Approved bool); it must resolve through the
+// same path as approval_decision.
+func TestApprovalResponseBridging(t *testing.T) {
+	wsURL := startTestRelay(t)
+	s, secret := newTestSession(t, wsURL, nil)
+
+	conn, keys := grantControl(t, wsURL, s, secret, "alice")
+
+	done := make(chan struct{})
+	var decision string
+	var reqErr error
+	go func() {
+		defer close(done)
+		decision, reqErr = s.RequestApproval(context.Background(),
+			"restart the service?", nil, time.Minute)
+	}()
+	reqMsg := readUntil(t, conn, 5*time.Second, protocol.TypeApprovalRequest)
+	var req protocol.ApprovalRequest
+	openPayload(t, reqMsg, keys.HostToExpert, &req)
+
+	sendEncrypted(t, conn, keys.ExpertToHost, "alice", protocol.TypeApprovalResponse, protocol.ApprovalResponse{
+		SessionID:  s.SessionID(),
+		ApprovalID: req.ApprovalID,
+		Approved:   true,
+		Responder:  "alice",
+	})
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("RequestApproval did not resolve via approval_response")
+	}
+	if reqErr != nil || decision != DecisionApprove {
+		t.Errorf("decision = %q, err = %v; want approve", decision, reqErr)
+	}
+	dismiss := readUntil(t, conn, 5*time.Second, protocol.TypeApprovalResponse)
+	var resp protocol.ApprovalResponse
+	openPayload(t, dismiss, keys.HostToExpert, &resp)
+	if !resp.Broadcast || !resp.Approved {
+		t.Errorf("bad dismissal broadcast: %+v", resp)
+	}
+}
+
+// TestInvalidDecisionFailsClosedImmediately answers with a choice that is
+// not valid for the prompt: the request must fail closed right away, not
+// linger until the TTL.
+func TestInvalidDecisionFailsClosedImmediately(t *testing.T) {
+	wsURL := startTestRelay(t)
+	s, secret := newTestSession(t, wsURL, nil)
+
+	conn, keys := grantControl(t, wsURL, s, secret, "alice")
+
+	done := make(chan struct{})
+	var decision string
+	go func() {
+		defer close(done)
+		decision, _ = s.RequestApproval(context.Background(),
+			"wipe the disk?", []string{"wipe", "keep"}, time.Minute)
+	}()
+	reqMsg := readUntil(t, conn, 5*time.Second, protocol.TypeApprovalRequest)
+	var req protocol.ApprovalRequest
+	openPayload(t, reqMsg, keys.HostToExpert, &req)
+
+	start := time.Now()
+	sendEncrypted(t, conn, keys.ExpertToHost, "alice", protocol.TypeApprovalDecision, protocol.ApprovalDecision{
+		SessionID:  s.SessionID(),
+		ApprovalID: req.ApprovalID,
+		Decision:   "maybe-later",
+		DecidedBy:  "alice",
+		DecidedAt:  time.Now().Unix(),
+	})
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("invalid decision did not fail closed")
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Errorf("fail-closed took %v, want immediate", elapsed)
+	}
+	if decision != DecisionDeny {
+		t.Errorf("decision = %q, want deny", decision)
+	}
+	if n := s.Status().PendingApprovals; n != 0 {
+		t.Errorf("pending approvals = %d, want 0", n)
+	}
+	// The expert sees the dismissal broadcast.
+	dismiss := readUntil(t, conn, 5*time.Second, protocol.TypeApprovalResponse)
+	var resp protocol.ApprovalResponse
+	openPayload(t, dismiss, keys.HostToExpert, &resp)
+	if !resp.Broadcast || resp.Approved {
+		t.Errorf("bad dismissal broadcast: %+v", resp)
+	}
+}
+
+// TestExecOutputMasksSecrets runs a command whose output contains a token:
+// the expert-facing ExecOutput must be masked.
+func TestExecOutputMasksSecrets(t *testing.T) {
+	wsURL := startTestRelay(t)
+	s, secret := newTestSession(t, wsURL, nil)
+
+	conn, keys := grantControl(t, wsURL, s, secret, "alice")
+	defer conn.Close()
+
+	sendEncrypted(t, conn, keys.ExpertToHost, "alice", protocol.TypeExecRequest, protocol.ExecRequest{
+		SessionID: s.SessionID(),
+		ID:        "e1",
+		Command:   "echo ghp_abcDEF1234567890",
+	})
+	outMsg := readUntil(t, conn, 5*time.Second, protocol.TypeExecOutput)
+	var out protocol.ExecOutput
+	openPayload(t, outMsg, keys.HostToExpert, &out)
+	if strings.Contains(out.Stdout, "ghp_abcDEF1234567890") {
+		t.Errorf("secret leaked in exec output: %q", out.Stdout)
+	}
+	if !strings.Contains(out.Stdout, "[REDACTED]") {
+		t.Errorf("exec output not masked: %q", out.Stdout)
+	}
+}
+
+// TestExecCommandTooLong rejects an over-32-KiB command with an error
+// ExecOutput before anything runs.
+func TestExecCommandTooLong(t *testing.T) {
+	wsURL := startTestRelay(t)
+	s, secret := newTestSession(t, wsURL, nil)
+
+	conn, keys := grantControl(t, wsURL, s, secret, "alice")
+	defer conn.Close()
+
+	sendEncrypted(t, conn, keys.ExpertToHost, "alice", protocol.TypeExecRequest, protocol.ExecRequest{
+		SessionID: s.SessionID(),
+		ID:        "big",
+		Command:   "echo " + strings.Repeat("x", 33*1024),
+	})
+	outMsg := readUntil(t, conn, 5*time.Second, protocol.TypeExecOutput)
+	var out protocol.ExecOutput
+	openPayload(t, outMsg, keys.HostToExpert, &out)
+	if out.ID != "big" || out.ExitCode != -1 || !strings.Contains(out.Stderr, "32 KiB") {
+		t.Errorf("bad overlong-command output: %+v", out)
+	}
+}
+
+// TestExpertChatTooLong gets an error envelope back, not a silent drop or
+// a truncation.
+func TestExpertChatTooLong(t *testing.T) {
+	wsURL := startTestRelay(t)
+	s, secret := newTestSession(t, wsURL, nil)
+
+	conn, keys := enrollExpert(t, wsURL, s.SessionID(), "alice", secret)
+	defer conn.Close()
+	s.Poll() // drain the peer_joined item from enrollment
+
+	sendEncrypted(t, conn, keys.ExpertToHost, "alice", protocol.TypeExpertChat, protocol.ExpertChat{
+		SessionID:  s.SessionID(),
+		ExpertName: "alice",
+		Text:       strings.Repeat("y", 9*1024),
+	})
+	errMsg := readUntil(t, conn, 5*time.Second, protocol.TypeError)
+	var perr protocol.Error
+	openPayload(t, errMsg, keys.HostToExpert, &perr)
+	if perr.Code != "too_large" {
+		t.Errorf("error code = %q, want too_large", perr.Code)
+	}
+	if items := s.Poll(); len(items) != 0 {
+		t.Errorf("overlong chat reached the inbox: %+v", items)
+	}
+}
+
+// TestConfirmRestorePastDeadlineRefused parks a rewind, lets the 60s
+// deadline pass (shrunk for the test), and confirms: refused, fail
+// closed.
+func TestConfirmRestorePastDeadlineRefused(t *testing.T) {
+	old := restoreConfirmTTL
+	restoreConfirmTTL = 100 * time.Millisecond
+	t.Cleanup(func() { restoreConfirmTTL = old })
+
+	wsURL := startTestRelay(t)
+	s, secret := newTestSession(t, wsURL, nil)
+
+	conn, keys := grantControl(t, wsURL, s, secret, "alice")
+	defer conn.Close()
+
+	if _, err := s.Checkpoint("cp1"); err != nil {
+		t.Fatalf("Checkpoint: %v", err)
+	}
+	sendEncrypted(t, conn, keys.ExpertToHost, "alice", protocol.TypeCheckpointRestore, protocol.CheckpointRestore{
+		SessionID: s.SessionID(),
+		Label:     "cp1",
+	})
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		found := false
+		for _, it := range s.Poll() {
+			if it.Type == "restore_requested" {
+				found = true
+			}
+		}
+		if found {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	time.Sleep(200 * time.Millisecond) // let the deadline pass
+	if err := s.ConfirmRestore(); err == nil {
+		t.Fatal("ConfirmRestore past the deadline should be refused")
+	}
+	if got := s.Status().Checkpoints; len(got) != 1 {
+		t.Errorf("checkpoints = %v", got)
+	}
+}
+
+// TestNewRejectsMissingWorkdir fails session creation loudly on a bad
+// workdir instead of misbehaving later.
+func TestNewRejectsMissingWorkdir(t *testing.T) {
+	wsURL := startTestRelay(t)
+	secret, err := pairing.GenerateSecret()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = New(Config{
+		RelayURL: wsURL,
+		WorkDir:  filepath.Join(t.TempDir(), "no-such-dir"),
+		Secret:   secret,
+	})
+	if err == nil {
+		t.Fatal("New with a missing workdir should fail")
+	}
+}
+
+// TestNegativeApprovalTimeoutClampsToOneSecond: a negative timeout is
+// nonsense and must clamp to the 1s minimum, not the 2-minute maximum.
+func TestNegativeApprovalTimeoutClampsToOneSecond(t *testing.T) {
+	wsURL := startTestRelay(t)
+	s, secret := newTestSession(t, wsURL, nil)
+
+	conn, keys := enrollExpert(t, wsURL, s.SessionID(), "alice", secret)
+	defer conn.Close()
+
+	done := make(chan struct{})
+	start := time.Now()
+	go func() {
+		defer close(done)
+		_, _ = s.RequestApproval(context.Background(), "anything?", nil, -time.Hour)
+	}()
+	reqMsg := readUntil(t, conn, 5*time.Second, protocol.TypeApprovalRequest)
+	var req protocol.ApprovalRequest
+	openPayload(t, reqMsg, keys.HostToExpert, &req)
+	if req.TimeoutSec != 1 {
+		t.Errorf("TimeoutSec = %d, want 1 for a negative timeout", req.TimeoutSec)
+	}
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("negative-timeout approval did not resolve")
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("negative timeout resolved in %v, want ~1s", elapsed)
 	}
 }

@@ -87,3 +87,64 @@ func TestMaskFields(t *testing.T) {
 		t.Errorf("nil fields should stay nil")
 	}
 }
+
+func TestMaskSecretsNewTokenShapes(t *testing.T) {
+	ins := []string{
+		"stripe key sk_live_abcDEF1234567890wxyz",
+		"restricted rk_live_abcDEF1234567890wxyz",
+		"openai sk-proj-abcDEF1234567890wxyz-0987",
+		"gitlab glpat-abcdefghijklmnopqrst",
+		"npm npm_abcdefghijklmnopqrstuvwx",
+		"aws ASIAIOSFODNN7EXAMPLE key id",
+	}
+	for _, in := range ins {
+		got := MaskSecrets(in)
+		if !strings.Contains(got, "[REDACTED]") {
+			t.Errorf("MaskSecrets(%q) = %q, want redaction", in, got)
+		}
+	}
+}
+
+func TestMaskSecretsURLCredentials(t *testing.T) {
+	in := "postgres://deploy:s3cr3t-pw@db.internal:5432/app"
+	got := MaskSecrets(in)
+	if strings.Contains(got, "s3cr3t-pw") || strings.Contains(got, "deploy:") {
+		t.Errorf("url credentials leaked: %q", got)
+	}
+	if !strings.Contains(got, "db.internal") || !strings.Contains(got, "[REDACTED]@") {
+		t.Errorf("url mangled: %q", got)
+	}
+}
+
+func TestMaskSecretsQuotedValueWithSpaces(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{`password="my secret phrase"`, `password=[REDACTED]`},
+		{`api_key: 'hunter2 hunter3'`, `api_key: [REDACTED]`},
+		{`"token": "abc 123 xyz"`, `"token": [REDACTED]`},
+	}
+	for _, c := range cases {
+		if got := MaskSecrets(c.in); got != c.want {
+			t.Errorf("MaskSecrets(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestMaskSecretFieldsStructural(t *testing.T) {
+	in := map[string]any{
+		"token":  "ghp_abcDEF1234567890",
+		"nested": map[string]any{"password": "hunter2"},
+		"ok":     true,
+		"count":  3,
+	}
+	out := MaskSecretFields(in)
+	if out["token"] != "[REDACTED]" {
+		t.Errorf("token = %v", out["token"])
+	}
+	nested, ok := out["nested"].(map[string]any)
+	if !ok || nested["password"] != "[REDACTED]" {
+		t.Errorf("nested = %v", out["nested"])
+	}
+	if out["ok"] != true || out["count"] != 3 {
+		t.Errorf("non-secrets changed: %v", out)
+	}
+}
