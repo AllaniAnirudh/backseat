@@ -1,12 +1,14 @@
 // Package e2e runs a full backseat session against an in-process relay:
-// host with a fake agent, one expert joining with the right secret, one
-// rejected with the wrong secret, control handoff, driven input echoed
-// back, input gating after yield, and clean teardown.
+// host with a fake agent, experts completing the HMAC enrollment, encrypted
+// control handoff, driven input echoed back through per-expert encryption,
+// input gating (non-controller and post-yield input dropped), enrollment
+// failure kicking, pending-enrollment timeout, and clean teardown.
 package e2e
 
 import (
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
 	"net"
 	"net/http"
 	"strings"
@@ -33,15 +35,65 @@ func dialWS(t *testing.T, url string) *websocket.Conn {
 	return conn
 }
 
-func sendEnvelope(t *testing.T, conn *websocket.Conn, msgType string, payload any) {
+// sendEnvelope writes one plaintext envelope.
+func sendEnvelope(t *testing.T, conn *websocket.Conn, msgType, from, to string, payload any) {
 	t.Helper()
 	msg, err := protocol.New(msgType, "test-id", time.Now().UnixMilli(), payload)
 	if err != nil {
 		t.Fatalf("marshal %s: %v", msgType, err)
 	}
+	msg.From = from
+	msg.To = to
 	if err := conn.WriteJSON(msg); err != nil {
 		t.Fatalf("send %s: %v", msgType, err)
 	}
+}
+
+// sendEncrypted seals the payload with key and writes the envelope.
+func sendEncrypted(t *testing.T, conn *websocket.Conn, key [32]byte, from, msgType string, payload any) {
+	t.Helper()
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := pairing.Seal(key, raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg := protocol.Message{
+		Type:      msgType,
+		ID:        "test-id",
+		Timestamp: time.Now().UnixMilli(),
+		From:      from,
+		To:        "host",
+		Payload:   env,
+	}
+	if err := conn.WriteJSON(msg); err != nil {
+		t.Fatalf("send %s: %v", msgType, err)
+	}
+}
+
+// openPayload decrypts a host->expert envelope with the HostToExpert key.
+func openPayload(t *testing.T, msg protocol.Message, key [32]byte, out any) {
+	t.Helper()
+	raw, err := pairing.Open(key, msg.Payload)
+	if err != nil {
+		t.Fatalf("decrypt %s: %v", msg.Type, err)
+	}
+	if err := json.Unmarshal(raw, out); err != nil {
+		t.Fatalf("decode %s: %v", msg.Type, err)
+	}
+}
+
+func decodeOutput(t *testing.T, msg protocol.Message, key [32]byte) string {
+	t.Helper()
+	var out protocol.TermOutput
+	openPayload(t, msg, key, &out)
+	raw, err := base64.StdEncoding.DecodeString(out.Data)
+	if err != nil {
+		t.Fatalf("decode base64: %v", err)
+	}
+	return string(raw)
 }
 
 // readEnvelope reads one envelope, failing the test on timeout.
@@ -85,23 +137,10 @@ func waitFor(t *testing.T, timeout time.Duration, cond func() bool, what string)
 	t.Fatalf("timed out waiting for %s", what)
 }
 
-func decodeOutput(t *testing.T, msg protocol.Message) string {
-	t.Helper()
-	var out protocol.TermOutput
-	if err := msg.Decode(&out); err != nil {
-		t.Fatalf("decode term_output: %v", err)
-	}
-	raw, err := base64.StdEncoding.DecodeString(out.Data)
-	if err != nil {
-		t.Fatalf("decode base64: %v", err)
-	}
-	return string(raw)
-}
-
-// joinExpert dials and joins, retrying while the host's announce is still
-// propagating to the relay (the announce is sent async, so an instant join
-// can legitimately hit no_session).
-func joinExpert(t *testing.T, wsURL, name, secretB64 string) *websocket.Conn {
+// joinUntilAccepted dials, sends a secretless room_join, and returns the
+// connection plus the first accepted message, retrying while the host's
+// announcement hasn't reached the relay yet.
+func joinUntilAccepted(t *testing.T, wsURL, session, name string) (*websocket.Conn, protocol.Message) {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
@@ -110,39 +149,71 @@ func joinExpert(t *testing.T, wsURL, name, secretB64 string) *websocket.Conn {
 			time.Sleep(50 * time.Millisecond)
 			continue
 		}
-		join, err := protocol.New(protocol.TypeRoomJoin, "test-id", time.Now().UnixMilli(), protocol.RoomJoin{
-			SessionID:  sessionID,
+		sendEnvelope(t, conn, protocol.TypeRoomJoin, name, "", protocol.RoomJoin{
+			SessionID:  session,
 			ExpertName: name,
-			Secret:     secretB64,
 		})
-		if err != nil {
-			t.Fatal(err)
-		}
 		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-		if err := conn.WriteJSON(join); err != nil {
-			conn.Close()
-			continue
-		}
 		var msg protocol.Message
 		if err := conn.ReadJSON(&msg); err != nil {
 			conn.Close()
 			time.Sleep(50 * time.Millisecond)
 			continue
 		}
-		if msg.Type == protocol.TypeSessionAnnounce {
-			t.Cleanup(func() { conn.Close() })
-			return conn
-		}
-		var e protocol.Error
-		if derr := msg.Decode(&e); derr == nil && e.Code == "no_session" {
+		_ = conn.SetReadDeadline(time.Time{})
+		if msg.Type == protocol.TypeError {
+			var e protocol.Error
+			if msg.Decode(&e) == nil && e.Code == "no_session" {
+				conn.Close()
+				time.Sleep(50 * time.Millisecond)
+				continue
+			}
 			conn.Close()
-			time.Sleep(50 * time.Millisecond)
-			continue
+			t.Fatalf("expert join rejected: %+v", e)
 		}
-		t.Fatalf("expert join rejected: %+v", e)
+		t.Cleanup(func() { conn.Close() })
+		return conn, msg
 	}
-	t.Fatal("expert could not join within 10s")
-	return nil
+	t.Fatal("join never accepted within 10s")
+	return nil, protocol.Message{}
+}
+
+// enrollExpert dials, joins with no secret, and runs the HMAC enrollment,
+// returning the connection and the derived directional keys.
+func enrollExpert(t *testing.T, wsURL, name string, secret [32]byte) (*websocket.Conn, pairing.Keys) {
+	t.Helper()
+	conn, first := joinUntilAccepted(t, wsURL, sessionID, name)
+	{
+		var pe protocol.PairingEnroll
+		if first.Type != protocol.TypePairingEnroll || first.Decode(&pe) != nil || pe.Phase != 1 {
+			t.Fatalf("expected pairing_enroll phase 1, got %s", first.Type)
+		}
+		chRaw, err := base64.StdEncoding.DecodeString(pe.Challenge)
+		if err != nil || len(chRaw) != pairing.SecretLen {
+			t.Fatalf("bad challenge: %v", err)
+		}
+		var challenge [pairing.SecretLen]byte
+		copy(challenge[:], chRaw)
+		resp := pairing.EnrollmentResponse(secret, challenge)
+		keys, err := pairing.DeriveKeys(secret, challenge)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sendEnvelope(t, conn, protocol.TypePairingEnroll, name, "host", protocol.PairingEnroll{
+			SessionID: sessionID,
+			Phase:     2,
+			Response:  base64.StdEncoding.EncodeToString(resp[:]),
+		})
+		// Phase 3 ack, then the encrypted session announcement.
+		readUntil(t, conn, 5*time.Second, protocol.TypePairingEnroll)
+		annMsg := readUntil(t, conn, 5*time.Second, protocol.TypeSessionAnnounce)
+		var ann protocol.SessionAnnounce
+		openPayload(t, annMsg, keys.HostToExpert, &ann)
+		if ann.Harness != "echo" {
+			t.Fatalf("bad announce: %+v", ann)
+		}
+		return conn, keys
+	}
 }
 
 func TestBackseatFlow(t *testing.T) {
@@ -160,7 +231,6 @@ func TestBackseatFlow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	secretB64 := base64.RawURLEncoding.EncodeToString(secret[:])
 
 	// Host with a fake agent: an echo loop over stdin.
 	h, err := host.New(host.Config{
@@ -177,53 +247,48 @@ func TestBackseatFlow(t *testing.T) {
 	}
 	defer h.End("test cleanup")
 
-	// 1. Expert joins with the correct secret and gets the session echo.
-	expert := joinExpert(t, wsURL, "expert1", secretB64)
+	// 1. Expert enrolls through the HMAC ceremony and gets the encrypted
+	// session announcement.
+	expert1, keys1 := enrollExpert(t, wsURL, "expert1", secret)
+	waitFor(t, 5*time.Second, func() bool { return h.Enrolled("expert1") }, "host enrollment state")
 
-	// 2. Wrong secret: relay rejects with bad_secret and closes the conn.
-	bad := make([]byte, 32)
-	if _, err := rand.Read(bad); err != nil {
-		t.Fatal(err)
-	}
-	impostor := dialWS(t, wsURL)
-	sendEnvelope(t, impostor, protocol.TypeRoomJoin, protocol.RoomJoin{
-		SessionID:  sessionID,
-		ExpertName: "impostor",
-		Secret:     base64.RawURLEncoding.EncodeToString(bad),
-	})
-	rej := readUntil(t, impostor, 5*time.Second, protocol.TypeError)
-	var rejErr protocol.Error
-	if err := rej.Decode(&rejErr); err != nil || rejErr.Code != "bad_secret" {
-		t.Fatalf("expected bad_secret rejection, got %+v (err %v)", rejErr, err)
-	}
-	_ = impostor.SetReadDeadline(time.Now().Add(2 * time.Second))
-	var after protocol.Message
-	if err := impostor.ReadJSON(&after); err == nil {
-		t.Fatalf("expected impostor connection to close, got %s", after.Type)
-	}
-
-	// 3. Control request: host auto-grants, expert sees the grant.
-	sendEnvelope(t, expert, protocol.TypeControlRequest, protocol.ControlRequest{
+	// 2. Duplicate names are rejected by the relay.
+	dup := dialWS(t, wsURL)
+	sendEnvelope(t, dup, protocol.TypeRoomJoin, "expert1", "", protocol.RoomJoin{
 		SessionID:  sessionID,
 		ExpertName: "expert1",
 	})
-	grant := readUntil(t, expert, 5*time.Second, protocol.TypeControlGrant)
+	rej := readUntil(t, dup, 5*time.Second, protocol.TypeError)
+	var rejErr protocol.Error
+	if err := rej.Decode(&rejErr); err != nil || rejErr.Code != "name_taken" {
+		t.Fatalf("expected name_taken rejection, got %+v (err %v)", rejErr, err)
+	}
+
+	// 3. Control request (encrypted): host auto-grants, expert sees the
+	// decrypted grant.
+	sendEncrypted(t, expert1, keys1.ExpertToHost, "expert1", protocol.TypeControlRequest, protocol.ControlRequest{
+		SessionID:  sessionID,
+		ExpertName: "expert1",
+	})
+	grantMsg := readUntil(t, expert1, 5*time.Second, protocol.TypeControlGrant)
 	var gotGrant protocol.ControlGrant
-	if err := grant.Decode(&gotGrant); err != nil || gotGrant.ExpertName != "expert1" {
-		t.Fatalf("bad grant: %v", err)
+	openPayload(t, grantMsg, keys1.HostToExpert, &gotGrant)
+	if gotGrant.ExpertName != "expert1" {
+		t.Fatalf("bad grant: %+v", gotGrant)
 	}
 	waitFor(t, 5*time.Second, func() bool { return h.Controller() == "expert1" }, "host controller state")
 
-	// 4. Expert drives: input reaches the PTY, echoed output comes back.
-	sendEnvelope(t, expert, protocol.TypeTermInput, protocol.TermInput{
+	// 4. Expert drives: encrypted input reaches the PTY, encrypted output
+	// comes back.
+	sendEncrypted(t, expert1, keys1.ExpertToHost, "expert1", protocol.TypeTermInput, protocol.TermInput{
 		SessionID: sessionID,
 		Data:      base64.StdEncoding.EncodeToString([]byte("hello\n")),
 	})
 	deadline := time.Now().Add(5 * time.Second)
 	sawEcho := false
 	for time.Now().Before(deadline) && !sawEcho {
-		msg := readEnvelope(t, expert, time.Until(deadline))
-		if msg.Type == protocol.TypeTermOutput && strings.Contains(decodeOutput(t, msg), "echo:hello") {
+		msg := readEnvelope(t, expert1, time.Until(deadline))
+		if msg.Type == protocol.TypeTermOutput && strings.Contains(decodeOutput(t, msg, keys1.HostToExpert), "echo:hello") {
 			sawEcho = true
 		}
 	}
@@ -231,23 +296,78 @@ func TestBackseatFlow(t *testing.T) {
 		t.Fatal("expert never received the echoed input")
 	}
 
-	// 5. Yield: control returns to the host, so a further input must be
-	// dropped. We prove it by reading everything up to session_end and
-	// asserting the dropped marker never appears in any term_output.
-	// (Note: gorilla/websocket caches read errors permanently, so a
-	// deliberate read-timeout "silence check" would poison this conn.)
-	sendEnvelope(t, expert, protocol.TypeControlYield, protocol.ControlYield{
+	// 5. A second expert enrolls, but its input is dropped while expert1
+	// holds control. Proven by driving a marker through expert1 and
+	// asserting the intruder's text never echoes before it.
+	expert2, keys2 := enrollExpert(t, wsURL, "expert2", secret)
+	sendEncrypted(t, expert2, keys2.ExpertToHost, "expert2", protocol.TypeTermInput, protocol.TermInput{
+		SessionID: sessionID,
+		Data:      base64.StdEncoding.EncodeToString([]byte("intruder\n")),
+	})
+	sendEncrypted(t, expert1, keys1.ExpertToHost, "expert1", protocol.TypeTermInput, protocol.TermInput{
+		SessionID: sessionID,
+		Data:      base64.StdEncoding.EncodeToString([]byte("marker\n")),
+	})
+	deadline = time.Now().Add(5 * time.Second)
+	sawMarker := false
+	for time.Now().Before(deadline) && !sawMarker {
+		msg := readEnvelope(t, expert2, time.Until(deadline))
+		if msg.Type != protocol.TypeTermOutput {
+			continue
+		}
+		out := decodeOutput(t, msg, keys2.HostToExpert)
+		if strings.Contains(out, "echo:intruder") {
+			t.Fatal("non-controller input reached the PTY")
+		}
+		if strings.Contains(out, "echo:marker") {
+			sawMarker = true
+		}
+	}
+	if !sawMarker {
+		t.Fatal("expert2 never received the marker echo")
+	}
+
+	// 6. Yield: control returns to the host, so further input is dropped.
+	// Proven by scanning everything up to session_end for the dropped text.
+	sendEncrypted(t, expert1, keys1.ExpertToHost, "expert1", protocol.TypeControlYield, protocol.ControlYield{
 		SessionID:  sessionID,
 		ExpertName: "expert1",
 	})
 	waitFor(t, 5*time.Second, func() bool { return h.Controller() == "" }, "host controller release")
-	sendEnvelope(t, expert, protocol.TypeTermInput, protocol.TermInput{
+	sendEncrypted(t, expert1, keys1.ExpertToHost, "expert1", protocol.TypeTermInput, protocol.TermInput{
 		SessionID: sessionID,
 		Data:      base64.StdEncoding.EncodeToString([]byte("dropped\n")),
 	})
 
-	// 6. Host ends the session: expert gets session_end with no echo of the
-	// post-yield input anywhere before it.
+	// 7. Bad HMAC response: host fails the enrollment and the relay kicks.
+	impostor := dialWS(t, wsURL)
+	sendEnvelope(t, impostor, protocol.TypeRoomJoin, "impostor", "", protocol.RoomJoin{
+		SessionID:  sessionID,
+		ExpertName: "impostor",
+	})
+	readUntil(t, impostor, 5*time.Second, protocol.TypePairingEnroll) // phase 1
+	bad := make([]byte, 32)
+	if _, err := rand.Read(bad); err != nil {
+		t.Fatal(err)
+	}
+	sendEnvelope(t, impostor, protocol.TypePairingEnroll, "impostor", "host", protocol.PairingEnroll{
+		SessionID: sessionID,
+		Phase:     2,
+		Response:  base64.StdEncoding.EncodeToString(bad),
+	})
+	kick := readUntil(t, impostor, 5*time.Second, protocol.TypeError)
+	var kickErr protocol.Error
+	if err := kick.Decode(&kickErr); err != nil || kickErr.Code != "kicked" {
+		t.Fatalf("expected kicked error, got %+v (err %v)", kickErr, err)
+	}
+	_ = impostor.SetReadDeadline(time.Now().Add(2 * time.Second))
+	var after protocol.Message
+	if err := impostor.ReadJSON(&after); err == nil {
+		t.Fatalf("expected impostor connection to close, got %s", after.Type)
+	}
+
+	// 8. Host ends the session: expert1 gets session_end with no echo of
+	// the post-yield input anywhere before it.
 	h.End("test done")
 	deadline = time.Now().Add(5 * time.Second)
 	for {
@@ -255,10 +375,10 @@ func TestBackseatFlow(t *testing.T) {
 		if remaining <= 0 {
 			t.Fatal("timed out waiting for session_end")
 		}
-		msg := readEnvelope(t, expert, remaining)
+		msg := readEnvelope(t, expert1, remaining)
 		switch msg.Type {
 		case protocol.TypeTermOutput:
-			if strings.Contains(decodeOutput(t, msg), "echo:dropped") {
+			if strings.Contains(decodeOutput(t, msg, keys1.HostToExpert), "echo:dropped") {
 				t.Fatal("post-yield input was not gated: got echo of dropped input")
 			}
 		case protocol.TypeSessionEnd:
@@ -268,5 +388,55 @@ func TestBackseatFlow(t *testing.T) {
 			}
 			return
 		}
+	}
+}
+
+func TestPendingEnrollmentTimeout(t *testing.T) {
+	old := relay.PendingTimeout
+	relay.PendingTimeout = 300 * time.Millisecond
+	defer func() { relay.PendingTimeout = old }()
+
+	srv := relay.New()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go http.Serve(ln, srv)
+	wsURL := "ws://" + ln.Addr().String() + "/ws"
+
+	secret, err := pairing.GenerateSecret()
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := host.New(host.Config{
+		RelayURL:  wsURL,
+		SessionID: "timeout-session",
+		Secret:    secret,
+		HostName:  "testhost",
+		Harness:   "echo",
+		AgentCmd:  []string{"sh", "-c", `while IFS= read -r line; do printf 'echo:%s\n' "$line"; done`},
+	})
+	if err != nil {
+		t.Fatalf("host.New: %v", err)
+	}
+	defer h.End("test cleanup")
+
+	// Join but never answer the challenge: the relay must drop the peer.
+	// (The host announces async, so retry the join on no_session.)
+	conn, _ := joinUntilAccepted(t, wsURL, "timeout-session", "slowpoke")
+	_ = conn.SetReadDeadline(time.Time{})
+	timeoutMsg := readUntil(t, conn, 5*time.Second, protocol.TypeError)
+	var terr protocol.Error
+	if err := timeoutMsg.Decode(&terr); err != nil || terr.Code != "enrollment_timeout" {
+		t.Fatalf("expected enrollment_timeout, got %+v (err %v)", terr, err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	var after protocol.Message
+	if err := conn.ReadJSON(&after); err == nil {
+		t.Fatalf("expected timed-out connection to close, got %s", after.Type)
+	}
+	if h.Enrolled("slowpoke") {
+		t.Fatal("timed-out peer is marked enrolled on the host")
 	}
 }

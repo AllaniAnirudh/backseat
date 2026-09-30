@@ -32,10 +32,18 @@ const (
 )
 
 // Message is the envelope for every protocol frame.
+//
+// Routing metadata (type, to, from) stays plaintext so the relay can route
+// without reading content. After enrollment the payload is an AES-256-GCM
+// envelope; see internal/pairing. `from` is only a key-selection hint:
+// authenticity comes from the AEAD, so a spoofed `from` just fails
+// decryption and the message is dropped.
 type Message struct {
 	Type      string          `json:"type"`
 	ID        string          `json:"id"`
 	Timestamp int64           `json:"ts"`
+	To        string          `json:"to,omitempty"`   // recipient name; "" or "*" = broadcast
+	From      string          `json:"from,omitempty"` // sender name
 	Payload   json.RawMessage `json:"payload,omitempty"`
 }
 
@@ -65,12 +73,13 @@ type SessionAnnounce struct {
 	ExpiresAt  int64  `json:"expires_at"` // unix seconds; invite TTL
 }
 
-// RoomJoin is the first envelope an expert sends. The invite secret travels
-// inside the payload, never in the URL path or query string.
+// RoomJoin is the first envelope an expert sends. It carries no secret:
+// the relay admits the join on invite freshness alone, and the host
+// verifies the expert holds the invite secret through the HMAC enrollment
+// (pairing_enroll) before any content flows.
 type RoomJoin struct {
 	SessionID  string `json:"session_id"`
 	ExpertName string `json:"expert_name"`
-	Secret     string `json:"secret"` // base64url-encoded 32-byte invite secret
 }
 
 // PeerKick drops one expert from the room. Sent by the host; enforced by
@@ -97,10 +106,15 @@ type PairingInvite struct {
 }
 
 // PairingEnroll carries one step of the two-phase HMAC enrollment.
+// Phase 1: host -> expert, fresh challenge. Phase 2: expert -> host, the
+// HMAC-SHA256(secret, challenge) response. Phase 3: host -> expert,
+// enrollment confirmed; the following session_announce arrives encrypted.
+// The payloads stay plaintext by design: the cryptography is the HMAC
+// itself, and the relay needs the `to` field to route the handshake.
 type PairingEnroll struct {
 	SessionID string `json:"session_id"`
 	InviteID  string `json:"invite_id"`
-	Phase     int    `json:"phase"`               // 1 = host challenge, 2 = expert response
+	Phase     int    `json:"phase"`               // 1 = host challenge, 2 = expert response, 3 = enrolled
 	Challenge string `json:"challenge,omitempty"` // base64, phase 1
 	Response  string `json:"response,omitempty"`  // base64 HMAC, phase 2
 }

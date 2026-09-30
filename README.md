@@ -10,23 +10,23 @@ Backseat lets an expert take over someone else's live AI coding agent session. T
 
 ## Status: v0.1
 
-Works end to end on localhost: three terminals, one browser. `go build ./...`, `go vet ./...`, and `go test ./...` are green, including an in-process end-to-end test covering join, bad-secret rejection, control grant, driven input echoed back, input gating after yield, and clean teardown.
+Works end to end on localhost: three terminals, one browser. `go build ./...`, `go vet ./...`, and `go test ./...` are green, including an in-process end-to-end test covering HMAC enrollment, encrypted control grant, driven input echoed back through per-expert encryption, input gating (non-controller and post-yield input dropped), enrollment-failure kick, pending-enrollment timeout, and clean teardown.
 
 ### What v0.1 does
 
 - Captures any agent command in a PTY and streams the output to the host's own terminal and to connected viewers.
-- One-time invite links (`{ui}/?session={id}#secret={...}`): 10-minute expiry, the secret stays in the URL fragment so it never hits a server log, verified in constant time against a stored hash. A wrong secret gets an error and a closed connection; the secret is never logged.
-- Control handoff with novice consent: request, grant, deny, yield from either side, plus kick and end. Exactly one controller at a time, enforced by the host daemon and double-checked by the relay.
+- One-time invite links (`{ui}/?session={id}#secret={...}`): 10-minute expiry, the secret stays in the URL fragment so it never hits a server log. Joining experts prove they hold the secret with an HMAC-SHA256 challenge-response; a wrong answer gets them kicked, and the secret itself never crosses the wire.
+- End-to-end payload encryption: after enrollment, every host<->expert payload is AES-256-GCM encrypted with directional keys derived locally from the invite secret (HKDF-SHA256). The relay routes opaque envelopes and never sees session content.
+- Control handoff with novice consent: request, grant, deny, yield from either side, plus kick and end. Exactly one controller at a time, enforced by the host daemon.
 - Host console commands: `grant`, `deny [reason]`, `yield`, `kick <name> [reason]`, `end`, `help`.
 - Self-contained expert UI: xterm.js is vendored into the `backseat-expert` binary, so the page works with no CDN or internet access.
 
-### Honest limitation
+### Security posture
 
-The v0.1 relay routes plaintext envelopes, so run your own relay or one you trust. End-to-end payload encryption is on the v0.3 roadmap. See SECURITY.md for the full scope.
+The relay is untrusted by design: payloads are end-to-end encrypted and it only ever sees message types, the `to`/`from` routing fields, session ids, and timing. Honest limitations: no forward secrecy yet (a leaked invite secret decrypts that session's recorded traffic; each session gets a fresh secret), and no audit log yet. See SECURITY.md for the full scope.
 
 ### Deferred (see ARCHITECTURE.md roadmap)
 
-- End-to-end payload encryption from pairing keys (v0.3).
 - Transcript adapters, approval forwarding with one-tap buttons, checkpoints and rewind (v0.2/v0.3).
 - Novice typing directly into the PTY: in v0.1 the host stdin is a command console only.
 - NAT traversal / direct transport (v0.4).
@@ -36,11 +36,11 @@ The v0.1 relay routes plaintext envelopes, so run your own relay or one you trus
 ```
  novice machine                              relay                      expert browser
 ┌─────────────────────────┐                ┌──────────────┐                ┌──────────────────┐
-│ backseat host           │   WS envelopes │ backseat     │   WS envelopes │ backseat expert  │
-│ ┌─────────────────────┐ │                │ relay        │                │ ┌──────────────┐ │
-│ │ agent in a PTY      │─┼───────────────►│ routes by    ├───────────────►│ │ terminal via │ │
-│ │ (claude, copilot…)  │ │                │ session id   │                │ │ xterm.js     │ │
-│ └─────────────────────┘ │                │              │                │ └──────────────┘ │
+│ backseat host           │ E2E-encrypted│ backseat     │ E2E-encrypted│ backseat expert  │
+│ ┌─────────────────────┐ │ envelopes    │ relay        │ envelopes    │ ┌──────────────┐ │
+│ │ agent in a PTY      │─┼──────────────► routes      ├──────────────► │ terminal via │ │
+│ │ (claude, copilot…)  │ │              │ opaque       │              │ │ xterm.js     │ │
+│ └─────────────────────┘ │                │ envelopes    │              │ └──────────────┘ │
 │  ▲                      │                │              │                │  ▲               │
 │  │ invite link          │                │              │                │  │ control       │
 │  │ #secret=…            │                │              │                │  │ request/grant │
@@ -55,7 +55,7 @@ The v0.1 relay routes plaintext envelopes, so run your own relay or one you trus
 3. Novice types `grant` in their terminal. The expert now drives the session.
 4. Either side can end it: the novice types `end`, the expert clicks Yield control.
 
-Note: v0.1 does not yet do end-to-end encryption, so run your own relay or one you trust. E2E from pairing keys is on the v0.3 roadmap.
+Payloads are end-to-end encrypted from the pairing keys, so the relay never sees session content — only message types, routing fields, and timing.
 
 ## Quickstart
 

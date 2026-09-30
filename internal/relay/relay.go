@@ -1,10 +1,15 @@
 // Package relay routes opaque protocol envelopes between a backseat host
 // and attached experts. Rooms are keyed by session id.
 //
-// Trust notes for v0.1 (localhost demo): the relay sees envelope payloads
-// in cleartext, including the invite secret inside room_join. That is
-// acceptable on loopback; end-to-end payload encryption from the pairing
-// keys arrives in v0.3 per the roadmap. The relay never logs secrets.
+// Trust notes: the relay is untrusted by design. Host/expert payloads are
+// end-to-end encrypted with keys the relay never sees — derived locally on
+// both ends from the invite secret via the pairing ceremony — so the relay
+// only ever handles opaque envelopes plus the plaintext routing metadata
+// it needs: message type, session id, the to/from fields, and timing. The
+// one plaintext control type it acts on is peer_kick; everything else is
+// routed, never inspected. Experts join without presenting the secret; the
+// host verifies possession through the HMAC enrollment before any content
+// flows, and the relay drops peers that never complete it.
 package relay
 
 import (
@@ -25,17 +30,22 @@ import (
 // InviteTTL bounds how long after the announcement an expert may join.
 const InviteTTL = pairing.InviteTTL
 
+// PendingTimeout bounds how long a joined-but-unenrolled peer may linger.
+// It is a var so tests can shrink it.
+var PendingTimeout = 60 * time.Second
+
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true },
 }
 
 type peer struct {
-	conn   *websocket.Conn
-	send   chan protocol.Message
-	name   string
-	isHost bool
-	roomID string
-	once   sync.Once
+	conn    *websocket.Conn
+	send    chan protocol.Message
+	name    string
+	isHost  bool
+	roomID  string
+	pending bool // joined but not yet through the HMAC enrollment
+	once    sync.Once
 }
 
 func (p *peer) enqueue(msg protocol.Message) {
@@ -59,14 +69,11 @@ func (p *peer) close() {
 }
 
 type room struct {
-	mu         sync.Mutex
-	sessionID  string
-	verifier   string // hex SHA-256 of the invite secret
-	createdAt  time.Time
-	announce   protocol.SessionAnnounce
-	host       *peer
-	experts    map[*peer]string // peer -> expert name
-	controller string           // "" means the host holds control
+	mu        sync.Mutex
+	sessionID string
+	createdAt time.Time
+	host      *peer
+	experts   map[*peer]string // peer -> expert name
 }
 
 // Server routes envelopes between hosts and experts.
@@ -95,6 +102,10 @@ func newMsg(msgType string, payload any) protocol.Message {
 	return msg
 }
 
+// sessionIDOf reads the session id out of a plaintext payload. It only
+// works on unencrypted first envelopes (session_announce, room_join);
+// later traffic is routed per-connection, so the relay never needs to
+// look inside encrypted payloads.
 func sessionIDOf(msg protocol.Message) string {
 	var probe struct {
 		SessionID string `json:"session_id"`
@@ -131,8 +142,7 @@ func (p *peer) writePump() {
 	}
 }
 
-// reject sends an error envelope and closes the connection. The secret is
-// never logged.
+// reject sends an error envelope and closes the connection.
 func (s *Server) reject(p *peer, sessionID, code, message string) {
 	p.enqueue(newMsg(protocol.TypeError, protocol.Error{
 		SessionID: sessionID,
@@ -212,7 +222,7 @@ func (s *Server) servePeer(p *peer) {
 
 func (s *Server) serveHost(p *peer, sessionID string, msg protocol.Message) {
 	var ann protocol.SessionAnnounce
-	if err := msg.Decode(&ann); err != nil || ann.SecretHash == "" {
+	if err := msg.Decode(&ann); err != nil || ann.SessionID == "" {
 		s.reject(p, sessionID, "bad_envelope", "invalid session_announce")
 		return
 	}
@@ -222,9 +232,7 @@ func (s *Server) serveHost(p *peer, sessionID string, msg protocol.Message) {
 	}
 	rm := &room{
 		sessionID: sessionID,
-		verifier:  ann.SecretHash,
 		createdAt: time.Now(),
-		announce:  ann,
 		host:      p,
 		experts:   make(map[*peer]string),
 	}
@@ -254,7 +262,7 @@ func (s *Server) serveHost(p *peer, sessionID string, msg protocol.Message) {
 
 func (s *Server) serveExpert(p *peer, sessionID string, msg protocol.Message) {
 	var join protocol.RoomJoin
-	if err := msg.Decode(&join); err != nil {
+	if err := msg.Decode(&join); err != nil || join.ExpertName == "" {
 		s.reject(p, sessionID, "bad_envelope", "invalid room_join")
 		return
 	}
@@ -263,38 +271,60 @@ func (s *Server) serveExpert(p *peer, sessionID string, msg protocol.Message) {
 		s.reject(p, sessionID, "no_session", "no live session with that id")
 		return
 	}
+	name := join.ExpertName
 	rm.mu.Lock()
 	expired := time.Since(rm.createdAt) > InviteTTL
+	duplicate := false
+	for _, n := range rm.experts {
+		if n == name {
+			duplicate = true
+			break
+		}
+	}
 	rm.mu.Unlock()
 	if expired {
 		s.reject(p, sessionID, "expired", "invite expired")
 		return
 	}
-	if !pairing.CheckSecret(join.Secret, rm.verifier) {
-		s.reject(p, sessionID, "bad_secret", "wrong invite secret")
+	if duplicate {
+		s.reject(p, sessionID, "name_taken", "that expert name is already in the session")
 		return
-	}
-	name := join.ExpertName
-	if name == "" {
-		name = "expert"
 	}
 	p.name = name
 	p.roomID = sessionID
+	p.pending = true
 	rm.mu.Lock()
 	rm.experts[p] = name
-	ann := rm.announce
+	host := rm.host
 	rm.mu.Unlock()
-	log.Printf("relay: expert %q joined session %q", name, sessionID)
+	log.Printf("relay: expert %q joined session %q (pending enrollment)", name, sessionID)
 
-	// Tell the newcomer what the session is.
-	p.enqueue(newMsg(protocol.TypeSessionAnnounce, ann))
+	// The host starts the HMAC enrollment; the newcomer gets nothing yet.
+	msg.From = name
+	if host != nil {
+		host.enqueue(msg)
+	}
+
+	// Peers that never complete enrollment are dropped.
+	timer := time.AfterFunc(PendingTimeout, func() {
+		rm.mu.Lock()
+		_, stillThere := rm.experts[p]
+		rm.mu.Unlock()
+		if stillThere && p.pending {
+			p.enqueue(newMsg(protocol.TypeError, protocol.Error{
+				SessionID: sessionID,
+				Code:      "enrollment_timeout",
+				Message:   "enrollment not completed in time",
+			}))
+			p.close()
+			log.Printf("relay: expert %q dropped from session %q: enrollment timed out", name, sessionID)
+		}
+	})
+	defer timer.Stop()
 
 	defer func() {
 		rm.mu.Lock()
 		delete(rm.experts, p)
-		if rm.controller == name {
-			rm.controller = ""
-		}
 		empty := len(rm.experts) == 0 && rm.host == nil
 		rm.mu.Unlock()
 		if empty {
@@ -306,8 +336,22 @@ func (s *Server) serveExpert(p *peer, sessionID string, msg protocol.Message) {
 	s.pumpExpert(p, rm, name)
 }
 
-// pumpHost routes host envelopes: broadcasts go to experts, control state
-// is tracked so term_input can be gated on the way back.
+// markEnrolled clears the pending flag once the host confirms the
+// enrollment (phase 3 ack routed to the expert).
+func (s *Server) markEnrolled(rm *room, name string) {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+	for e, n := range rm.experts {
+		if n == name {
+			e.pending = false
+			return
+		}
+	}
+}
+
+// pumpHost routes host envelopes. peer_kick is the one plaintext control
+// type the relay acts on; everything else is routed by `to` and never
+// inspected.
 func (s *Server) pumpHost(p *peer, rm *room) {
 	for {
 		var msg protocol.Message
@@ -315,25 +359,12 @@ func (s *Server) pumpHost(p *peer, rm *room) {
 			return
 		}
 		switch msg.Type {
-		case protocol.TypeTermOutput:
-			s.broadcastExperts(rm, msg)
-		case protocol.TypeControlGrant:
-			var g protocol.ControlGrant
-			if msg.Decode(&g) == nil {
-				rm.mu.Lock()
-				rm.controller = g.ExpertName
-				rm.mu.Unlock()
-				log.Printf("relay: session %q control -> %q", rm.sessionID, g.ExpertName)
+		case protocol.TypePairingEnroll:
+			var pe protocol.PairingEnroll
+			if err := msg.Decode(&pe); err == nil && pe.Phase == 3 {
+				s.markEnrolled(rm, msg.To)
 			}
-			s.broadcastExperts(rm, msg)
-		case protocol.TypeControlDeny:
-			s.broadcastExperts(rm, msg)
-		case protocol.TypeControlYield:
-			rm.mu.Lock()
-			rm.controller = ""
-			rm.mu.Unlock()
-			log.Printf("relay: session %q control -> host", rm.sessionID)
-			s.broadcastExperts(rm, msg)
+			s.routeToExpert(rm, msg)
 		case protocol.TypePeerKick:
 			var k protocol.PeerKick
 			if msg.Decode(&k) != nil {
@@ -346,50 +377,50 @@ func (s *Server) pumpHost(p *peer, rm *room) {
 			s.dropRoom(rm.sessionID)
 			return
 		default:
-			// v0.1 ignores anything else from the host.
+			s.routeToExpert(rm, msg)
 		}
 	}
 }
 
-// pumpExpert routes expert envelopes. term_input only reaches the host when
-// it comes from the active controller; everything else is dropped.
+// pumpExpert forwards expert envelopes to the host, stamped with the
+// authoritative sender name. Control gating lives on the host now: the
+// relay cannot read encrypted payloads, so it enforces nothing beyond
+// routing.
 func (s *Server) pumpExpert(p *peer, rm *room, name string) {
 	for {
 		var msg protocol.Message
 		if err := p.conn.ReadJSON(&msg); err != nil {
 			return
 		}
-		switch msg.Type {
-		case protocol.TypeTermInput:
-			rm.mu.Lock()
-			allowed := rm.controller == name
-			host := rm.host
-			rm.mu.Unlock()
-			if !allowed || host == nil {
-				continue
-			}
-			host.enqueue(msg)
-		case protocol.TypeControlRequest:
-			rm.mu.Lock()
-			host := rm.host
-			rm.mu.Unlock()
-			if host != nil {
-				host.enqueue(msg)
-			}
-		case protocol.TypeControlYield:
-			rm.mu.Lock()
-			rm.controller = ""
-			host := rm.host
-			rm.mu.Unlock()
-			log.Printf("relay: session %q control -> host", rm.sessionID)
-			if host != nil {
-				host.enqueue(msg)
-			}
-		case protocol.TypeSessionEnd:
-			// Expert leaving voluntarily.
+		if msg.Type == protocol.TypeSessionEnd {
+			return // expert leaving voluntarily
+		}
+		msg.From = name
+		rm.mu.Lock()
+		host := rm.host
+		rm.mu.Unlock()
+		if host == nil {
 			return
-		default:
-			// v0.1 ignores anything else from experts.
+		}
+		host.enqueue(msg)
+	}
+}
+
+// routeToExpert delivers one host envelope: `to` names the recipient,
+// "" or "*" broadcasts. Unknown recipients are dropped.
+func (s *Server) routeToExpert(rm *room, msg protocol.Message) {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+	if msg.To == "" || msg.To == "*" {
+		for e := range rm.experts {
+			e.enqueue(msg)
+		}
+		return
+	}
+	for e, n := range rm.experts {
+		if n == msg.To {
+			e.enqueue(msg)
+			return
 		}
 	}
 }
@@ -410,9 +441,6 @@ func (s *Server) kickExpert(rm *room, name, reason string) {
 			target = e
 			break
 		}
-	}
-	if rm.controller == name {
-		rm.controller = ""
 	}
 	rm.mu.Unlock()
 	if target == nil {
