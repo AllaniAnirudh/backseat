@@ -16,12 +16,18 @@ import "regexp"
 const redacted = "[REDACTED]"
 
 // assignRe matches assignment-style secrets: api_key=..., "token": "...",
-// password='...'. The value is redacted, the key name is kept so the
-// expert still sees which field was involved.
-var assignRe = regexp.MustCompile(`(?i)(["']?)(api[_-]?key|client[_-]?secret|auth[_-]?token|access[_-]?token|refresh[_-]?token|secret|token|password|passwd|pwd)(["']?)(\s*[:=]\s*)(["']?)[^\s"';,}]+(["']?)`)
+// password='...'. Quoted values may contain spaces and redact fully; the
+// key name is kept so the expert still sees which field was involved.
+var assignRe = regexp.MustCompile(`(?i)(["']?)(api[_-]?key|client[_-]?secret|auth[_-]?token|access[_-]?token|refresh[_-]?token|secret|token|password|passwd|pwd)(["']?)(\s*[:=]\s*)("[^"]*"|'[^']*'|[^\s"';,}]+)`)
 
 // tokenRe matches known token prefixes.
-var tokenRe = regexp.MustCompile(`\b(ghp_[A-Za-z0-9]+|gho_[A-Za-z0-9]+|github_pat_[A-Za-z0-9_]+|xox[baprs]-[A-Za-z0-9-]+|sk-ant-[A-Za-z0-9-]+|sk-[A-Za-z0-9]{16,}|AIza[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16})\b`)
+var tokenRe = regexp.MustCompile(`\b(ghp_[A-Za-z0-9]+|gho_[A-Za-z0-9]+|github_pat_[A-Za-z0-9_]+|xox[baprs]-[A-Za-z0-9-]+|sk-ant-[A-Za-z0-9-]+|sk-proj-[A-Za-z0-9_-]{20,}|sk_live_[A-Za-z0-9]{20,}|rk_live_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9]{16,}|glpat-[A-Za-z0-9_-]{20,}|npm_[A-Za-z0-9]{20,}|AIza[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16})\b`)
+
+// awsSecretRe matches 40-char AWS-style secret keys.
+var awsSecretRe = regexp.MustCompile(`\b[A-Za-z0-9/+=]{40}\b`)
+
+// urlCredRe matches URL-embedded credentials: scheme://user:pass@host.
+var urlCredRe = regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.-]*://)([^/\s:@]+):([^/\s@]+)@`)
 
 // bearerRe matches Authorization: Bearer <token> shapes.
 var bearerRe = regexp.MustCompile(`(?i)(bearer\s+)[A-Za-z0-9._~+/-]+`)
@@ -36,9 +42,29 @@ var secretKeyRe = regexp.MustCompile(`(?i)(api[_-]?key|secret|token|password|pas
 func MaskSecrets(s string) string {
 	s = pemRe.ReplaceAllString(s, redacted+" PRIVATE KEY "+redacted)
 	s = assignRe.ReplaceAllString(s, `${1}${2}${3}${4}`+redacted)
+	s = urlCredRe.ReplaceAllString(s, `${1}`+redacted+`@`)
 	s = bearerRe.ReplaceAllString(s, `${1}`+redacted)
 	s = tokenRe.ReplaceAllString(s, redacted)
+	s = awsSecretRe.ReplaceAllString(s, redacted)
 	return s
+}
+
+// MaskSecretFields redacts secrets inside a metadata map before it is
+// flattened to strings or sent anywhere. Same rules as maskFields.
+func MaskSecretFields(fields map[string]any) map[string]any {
+	return maskFields(fields)
+}
+
+// maskStrings masks every string in ss, preserving order and length.
+func maskStrings(ss []string) []string {
+	if ss == nil {
+		return nil
+	}
+	out := make([]string, len(ss))
+	for i, s := range ss {
+		out[i] = MaskSecrets(s)
+	}
+	return out
 }
 
 // maskFields redacts secrets inside a metadata map: string values under

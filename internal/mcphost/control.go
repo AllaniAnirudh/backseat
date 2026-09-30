@@ -39,6 +39,13 @@ func (s *Session) ServeControl(sockPath string) error {
 	if err != nil {
 		return fmt.Errorf("mcphost: control socket: %w", err)
 	}
+	// Filesystem-gated: only the local user may talk to the socket.
+	if err := os.Chmod(sockPath, 0700); err != nil {
+		ln.Close()
+		os.Remove(sockPath)
+		return fmt.Errorf("mcphost: control socket chmod: %w", err)
+	}
+	fmt.Fprintf(os.Stderr, "backseat: control socket %s\n", sockPath)
 	defer ln.Close()
 	defer os.Remove(sockPath)
 	go func() {
@@ -92,6 +99,10 @@ func (s *Session) handleCtl(req ctlRequest) ctlResponse {
 	var err error
 	switch strings.ToLower(req.Cmd) {
 	case "grant":
+		// grant [name]: the name must match the pending requester.
+		if name := arg(0); name != "" && name != s.PendingControl() {
+			return ctlResponse{Error: fmt.Sprintf("no pending control request from %q", name)}
+		}
 		err = s.Grant()
 	case "deny":
 		err = s.Deny(rest(0))

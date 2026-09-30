@@ -8,13 +8,14 @@
 // here, never by the relay.
 //
 // Trust properties, carried over from v0.2 and extended:
-//   - Session creation is human-gated: the skill requires explicit human
-//     confirmation before the agent calls backseat__create_session, so a
-//     prompt-injected agent must never mint sessions.
-//   - Every control grant is novice-confirmed out-of-band of the model's
-//     tool calls. The MCP tool surface has no grant tool; the human
-//     confirms through the local control socket (ServeControl), e.g.
-//     `backseat-mcp ctl <sock> grant`.
+//   - Session creation is human-gated: the MCP server prompts the human
+//     on /dev/tty (which the agent has no access to) before minting, so a
+//     prompt-injected agent can never create a session on its own.
+//   - Every control grant is novice-confirmed: either out-of-band through
+//     the local control socket (ServeControl), e.g.
+//     `backseat-mcp ctl <sock> grant`, or, when Config.HumanConfirm is
+//     set, through a /dev/tty prompt the agent cannot forge. The MCP tool
+//     surface has no grant tool.
 //   - Invites are single-use: the secret burns on the first successful
 //     enrollment, and expires after 10 minutes either way.
 //   - Approval prompts from backseat__request_approval fail closed after
@@ -31,6 +32,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -47,8 +49,9 @@ import (
 const maxApprovalTTL = 2 * time.Minute
 
 // restoreConfirmTTL is how long the novice has to confirm an
-// expert-requested rewind before it auto-denies (fail closed).
-const restoreConfirmTTL = 60 * time.Second
+// expert-requested rewind before it auto-denies (fail closed). A var so
+// tests can shrink it.
+var restoreConfirmTTL = 60 * time.Second
 
 // maxExecConcurrent bounds how many expert shell commands run at once.
 const maxExecConcurrent = 2
@@ -82,6 +85,14 @@ type Config struct {
 	WorkDir   string // exec and checkpoint directory; empty means cwd
 	// ApprovalTTL caps request_approval waits; 0 means maxApprovalTTL.
 	ApprovalTTL time.Duration
+	// HumanConfirm prompts the human for a yes/no decision. The
+	// production wiring reads the answer from /dev/tty, which the agent
+	// has no access to, so a prompt-injected agent cannot forge it. It
+	// gates session creation (called by cmd/backseat-mcp before minting)
+	// and control grants (called on each control request when set). Nil
+	// means no auto-prompt: control requests stay pending for manual
+	// Grant(), which preserves tests and headless use.
+	HumanConfirm func(prompt string) (bool, error)
 	// OnEvent reports control-plane events (joins, grants, exec runs).
 	OnEvent func(string)
 }
@@ -180,6 +191,15 @@ func isZeroSecret(s [pairing.SecretLen]byte) bool {
 func New(cfg Config) (*Session, error) {
 	if cfg.HostName == "" {
 		cfg.HostName = "novice"
+	}
+	// The workdir must exist: exec and checkpoints both run inside it, and
+	// a typo'd path must fail loudly here rather than silently later.
+	if cfg.WorkDir != "" {
+		if fi, err := os.Stat(cfg.WorkDir); err != nil {
+			return nil, fmt.Errorf("mcphost: workdir %q: %w", cfg.WorkDir, err)
+		} else if !fi.IsDir() {
+			return nil, fmt.Errorf("mcphost: workdir %q is not a directory", cfg.WorkDir)
+		}
 	}
 	if cfg.SessionID == "" {
 		cfg.SessionID = newID()
@@ -327,8 +347,12 @@ func validDecision(decision string, options []string) bool {
 // blocks until they decide or the TTL lapses. It fails closed: expiry,
 // cancellation, a vanished expert, or session end all resolve to deny.
 func (s *Session) RequestApproval(ctx context.Context, prompt string, options []string, timeout time.Duration) (string, error) {
+	// A negative timeout is nonsense: clamp to the 1s minimum, not the
+	// 2-minute maximum. Zero keeps the configured default.
 	ttl := timeout
-	if ttl <= 0 {
+	if ttl < 0 {
+		ttl = time.Second
+	} else if ttl == 0 {
 		ttl = s.approvalTTL()
 	}
 	if ttl > maxApprovalTTL {
@@ -367,9 +391,9 @@ func (s *Session) RequestApproval(ctx context.Context, prompt string, options []
 		SessionID:  s.cfg.SessionID,
 		ApprovalID: p.id,
 		Tool:       "agent",
-		Summary:    prompt,
-		Prompt:     prompt,
-		Options:    options,
+		Summary:    MaskSecrets(prompt),
+		Prompt:     MaskSecrets(prompt),
+		Options:    maskStrings(options),
 		TimeoutSec: int(ttl.Seconds()),
 		ExpiresAt:  deadline.Unix(),
 	}
@@ -430,9 +454,8 @@ func (s *Session) broadcastApprovalDismissal(id string, approved bool, by string
 	}
 }
 
-// onApprovalDecision applies an expert's answer: only the controller (or
-// any enrolled expert when nobody holds control) may answer, only while
-// the prompt is fresh, and only with a valid choice.
+// onApprovalDecision applies an expert's structured answer through the
+// shared resolve path.
 func (s *Session) onApprovalDecision(from string, msg protocol.Message) {
 	raw, ok := s.link.Decrypt(from, msg.Payload)
 	if !ok {
@@ -442,29 +465,62 @@ func (s *Session) onApprovalDecision(from string, msg protocol.Message) {
 	if json.Unmarshal(raw, &dec) != nil || dec.ApprovalID == "" {
 		return
 	}
-	if dec.DecidedBy != "" && dec.DecidedBy != from {
+	s.resolveApproval(from, dec.ApprovalID, dec.Decision, dec.DecidedBy)
+}
+
+// onApprovalResponse bridges the v0.2 approval_response shape (expert ->
+// host, Approved bool) into the same resolve path as approval_decision,
+// so a session can mix PTY and in-harness clients.
+func (s *Session) onApprovalResponse(from string, msg protocol.Message) {
+	raw, ok := s.link.Decrypt(from, msg.Payload)
+	if !ok {
+		return
+	}
+	var resp protocol.ApprovalResponse
+	if json.Unmarshal(raw, &resp) != nil || resp.ApprovalID == "" || resp.Broadcast {
+		return
+	}
+	decision := DecisionDeny
+	if resp.Approved {
+		decision = DecisionApprove
+	}
+	s.resolveApproval(from, resp.ApprovalID, decision, resp.Responder)
+}
+
+// resolveApproval validates an expert's answer and applies it: only the
+// controller (or any enrolled expert when nobody holds control) may
+// answer, only while the prompt is fresh, and only with a valid choice.
+// Validation happens BEFORE the pending entry is removed; an invalid
+// answer fails closed immediately via failApproval (deny + dismiss
+// broadcast).
+func (s *Session) resolveApproval(from, approvalID, decision, decidedBy string) {
+	if decidedBy != "" && decidedBy != from {
 		return // decider must match the sender
 	}
 	s.mu.Lock()
-	p, ok := s.approvals[dec.ApprovalID]
-	controller := s.controller
+	p, ok := s.approvals[approvalID]
+	var decisionOK, expired bool
 	if ok {
-		delete(s.approvals, dec.ApprovalID)
+		expired = time.Now().After(p.deadline)
+		decisionOK = !expired &&
+			(s.controller == "" || from == s.controller) &&
+			validDecision(decision, p.options)
+		if decisionOK {
+			delete(s.approvals, approvalID)
+		}
 	}
 	s.mu.Unlock()
-	if !ok || time.Now().After(p.deadline) {
-		return // unknown or stale: never apply a stale answer
+	if !ok || expired {
+		return // unknown or stale: nothing left to resolve
 	}
-	if controller != "" && from != controller {
+	if !decisionOK {
+		s.failApproval(approvalID, "invalid decision")
 		return
 	}
-	if !validDecision(dec.Decision, p.options) {
-		return
-	}
-	s.broadcastApprovalDismissal(p.id, dec.Decision == DecisionApprove, from)
-	s.event(fmt.Sprintf("approval %q decided %q by %s", p.prompt, dec.Decision, from))
+	s.broadcastApprovalDismissal(p.id, decision == DecisionApprove, from)
+	s.event(fmt.Sprintf("approval %q decided %q by %s", p.prompt, decision, from))
 	select {
-	case p.resolve <- approvalOutcome{decision: dec.Decision, by: from}:
+	case p.resolve <- approvalOutcome{decision: decision, by: from}:
 	default:
 	}
 }
@@ -486,12 +542,13 @@ func (s *Session) ListCheckpoints() []*host.Checkpoint {
 }
 
 // broadcastCheckpointEvent sends a checkpoint event to every expert.
+// The label and message are expert-facing, so secrets are masked.
 func (s *Session) broadcastCheckpointEvent(action, label, message, snapshotID, marker string) {
 	ev := protocol.CheckpointEvent{
 		SessionID:        s.cfg.SessionID,
 		Action:           action,
-		Label:            label,
-		Message:          message,
+		Label:            MaskSecrets(label),
+		Message:          MaskSecrets(message),
 		SnapshotID:       snapshotID,
 		TranscriptMarker: marker,
 	}
@@ -579,7 +636,8 @@ func (s *Session) onCheckpointRestore(from string, msg protocol.Message) {
 }
 
 // ConfirmRestore executes the pending expert-requested rewind. The novice
-// calls this out-of-band; it is the veto gate.
+// calls this out-of-band; it is the veto gate. It checks the 60s deadline
+// itself: a confirm past the deadline is refused, fail closed.
 func (s *Session) ConfirmRestore() error {
 	s.mu.Lock()
 	pr := s.pendingRestore
@@ -587,6 +645,11 @@ func (s *Session) ConfirmRestore() error {
 	s.mu.Unlock()
 	if pr == nil {
 		return errors.New("mcphost: no pending rewind request")
+	}
+	if time.Since(pr.requested) > restoreConfirmTTL {
+		s.broadcastCheckpointEvent("restore_expired", pr.label, "novice confirmed too late", "", "")
+		s.event(fmt.Sprintf("rewind to %q confirmed past the deadline; denied", pr.label))
+		return errors.New("mcphost: rewind request expired")
 	}
 	cp, err := s.checkpoints.Restore(pr.label)
 	if err != nil {
@@ -649,6 +712,8 @@ func (s *Session) readLoop() {
 			s.onExpertChat(msg)
 		case protocol.TypeApprovalDecision:
 			s.onApprovalDecision(msg.From, msg)
+		case protocol.TypeApprovalResponse:
+			s.onApprovalResponse(msg.From, msg)
 		case protocol.TypeExecRequest:
 			s.onExecRequest(msg)
 		case protocol.TypeCheckpointCreate:
@@ -703,6 +768,15 @@ func (s *Session) onEnrollResponse(from string, pe protocol.PairingEnroll) {
 		return
 	}
 	s.mu.Lock()
+	// Re-check invite expiry after the (slow) HMAC verification: an
+	// enrollment that straddles the deadline must not slip through the
+	// overhang between join and response.
+	if time.Now().After(s.inviteExpiry) {
+		s.mu.Unlock()
+		s.link.Forget(from)
+		s.failEnroll(from, "invite expired")
+		return
+	}
 	if s.inviteBurned {
 		s.mu.Unlock()
 		s.link.Forget(from)
@@ -729,41 +803,98 @@ func (s *Session) failEnroll(name, reason string) {
 }
 
 // onControlRequest parks an expert control request for novice confirmation.
-// Exactly one controller at a time; a second request is denied while one
-// is pending. Grants never happen without the novice.
+// The relay stamps msg.From on every envelope; the payload's ExpertName is
+// never trusted. Exactly one controller at a time; a second request is
+// denied while one is pending. Grants never happen without the novice.
 func (s *Session) onControlRequest(msg protocol.Message) {
-	raw, ok := s.link.Decrypt(msg.From, msg.Payload)
+	from := msg.From
+	if from == "" {
+		return
+	}
+	raw, ok := s.link.Decrypt(from, msg.Payload)
 	if !ok {
 		return
 	}
 	var req protocol.ControlRequest
-	if json.Unmarshal(raw, &req) != nil || req.ExpertName == "" {
+	if json.Unmarshal(raw, &req) != nil {
 		return
+	}
+	if req.ExpertName != "" && req.ExpertName != from {
+		return // payload name disagrees with the stamped sender: drop it
 	}
 	s.mu.Lock()
 	if s.pendingControl != "" {
 		s.mu.Unlock()
-		_ = s.link.SendTo(req.ExpertName, protocol.TypeControlDeny, protocol.ControlDeny{
+		_ = s.link.SendTo(from, protocol.TypeControlDeny, protocol.ControlDeny{
 			SessionID:  s.cfg.SessionID,
-			ExpertName: req.ExpertName,
+			ExpertName: from,
 			Reason:     "another request is pending",
 		})
 		return
 	}
-	if s.controller == req.ExpertName {
+	if s.controller == from {
 		s.mu.Unlock()
 		return // already driving
 	}
-	s.pendingControl = req.ExpertName
+	s.pendingControl = from
 	s.mu.Unlock()
 	note := ""
 	if req.Note != "" {
 		note = " (" + req.Note + ")"
 	}
-	s.event(fmt.Sprintf("%s requests control%s; novice confirm needed", req.ExpertName, note))
-	s.pushInbox(InboxItem{Type: "control_request", From: req.ExpertName,
-		Text: fmt.Sprintf("%s requests control%s. The human must confirm out-of-band before any grant.", req.ExpertName, note),
-		Data: map[string]any{"expert": req.ExpertName, "note": req.Note}})
+	s.event(fmt.Sprintf("%s requests control%s; novice confirm needed", from, note))
+	s.pushInbox(InboxItem{Type: "control_request", From: from,
+		Text: fmt.Sprintf("%s requests control%s. The human must confirm out-of-band before any grant.", from, note),
+		Data: map[string]any{"expert": from, "note": req.Note}})
+	if s.cfg.HumanConfirm != nil {
+		go s.promptControlGrant(from)
+	}
+}
+
+// promptControlGrant asks the human (through the /dev/tty confirmer the
+// agent cannot forge) whether to hand control to the named expert. Yes
+// grants; a no, a confirmer error, or no answer within 60s all deny, fail
+// closed. The goroutine never grants after the session ends.
+func (s *Session) promptControlGrant(expert string) {
+	type answer struct {
+		yes bool
+		err error
+	}
+	ch := make(chan answer, 1)
+	go func() {
+		yes, err := s.cfg.HumanConfirm(fmt.Sprintf(
+			"Expert '%s' requests control (chat + approvals + shell side-channel). Grant? [y/N]", expert))
+		ch <- answer{yes: yes, err: err}
+	}()
+	stillPending := func() bool {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.pendingControl == expert
+	}
+	select {
+	case <-s.Done():
+		return // session ended: never grant
+	case a := <-ch:
+		if !stillPending() {
+			return // superseded: a later request or the kill switch won
+		}
+		if a.err != nil {
+			s.event(fmt.Sprintf("control prompt for %s errored: %v", expert, a.err))
+			_ = s.Deny("confirmation error; failing closed")
+			return
+		}
+		if a.yes {
+			if err := s.Grant(); err != nil {
+				s.event(fmt.Sprintf("control grant for %s failed: %v", expert, err))
+			}
+			return
+		}
+		_ = s.Deny("novice declined at the prompt")
+	case <-time.After(60 * time.Second):
+		if stillPending() {
+			_ = s.Deny("no answer at the control prompt within 60s")
+		}
+	}
 }
 
 // Grant hands control to the expert with a pending request. Called by the
@@ -872,21 +1003,29 @@ func (s *Session) Kick(expert, reason string) {
 }
 
 // cancelApprovals fails every pending approval closed. The kill switch
-// always wins over a waiting prompt.
+// always wins over a waiting prompt. A parked rewind is denied out loud
+// so the expert UI never hangs on it.
 func (s *Session) cancelApprovals() {
 	s.mu.Lock()
 	ids := make([]string, 0, len(s.approvals))
 	for id := range s.approvals {
 		ids = append(ids, id)
 	}
+	pr := s.pendingRestore
 	s.pendingRestore = nil
 	s.mu.Unlock()
 	for _, id := range ids {
 		s.failApproval(id, "session ended")
 	}
+	if pr != nil {
+		s.broadcastCheckpointEvent("restore_denied", pr.label, "session ended", "", "")
+		s.event(fmt.Sprintf("rewind to %q denied: session ended", pr.label))
+	}
 }
 
-// onExpertChat drops an expert message into the agent inbox.
+// onExpertChat drops an expert message into the agent inbox. Overlong
+// chat is rejected with an error envelope to the sender, never silently
+// truncated.
 func (s *Session) onExpertChat(msg protocol.Message) {
 	raw, ok := s.link.Decrypt(msg.From, msg.Payload)
 	if !ok {
@@ -896,14 +1035,24 @@ func (s *Session) onExpertChat(msg protocol.Message) {
 	if json.Unmarshal(raw, &chat) != nil || strings.TrimSpace(chat.Text) == "" {
 		return
 	}
+	if len(chat.Text) > 8*1024 {
+		_ = s.link.SendTo(msg.From, protocol.TypeError, protocol.Error{
+			SessionID: s.cfg.SessionID,
+			Code:      "too_large",
+			Message:   "expert_chat text exceeds the 8 KiB limit",
+		})
+		s.event(fmt.Sprintf("chat from %s dropped: over 8 KiB", msg.From))
+		return
+	}
 	s.event(fmt.Sprintf("chat from %s: %q", msg.From, chat.Text))
 	s.pushInbox(InboxItem{Type: "expert_chat", From: msg.From, Text: chat.Text,
 		Data: map[string]any{"expert": msg.From}})
 }
 
 // onExecRequest runs a controller shell command, bounded. Only the
-// controller's requests run; anything else is dropped. Every run is
-// reported to the agent inbox, so exec is novice-visible.
+// controller's requests run; anything else gets an error answer, never
+// silence. Every run is reported to the agent inbox, so exec is
+// novice-visible.
 func (s *Session) onExecRequest(msg protocol.Message) {
 	raw, ok := s.link.Decrypt(msg.From, msg.Payload)
 	if !ok {
@@ -913,11 +1062,26 @@ func (s *Session) onExecRequest(msg protocol.Message) {
 	if json.Unmarshal(raw, &req) != nil || req.ID == "" {
 		return
 	}
+	if len(req.Command) > 32*1024 {
+		_ = s.link.SendTo(msg.From, protocol.TypeExecOutput, protocol.ExecOutput{
+			SessionID: s.cfg.SessionID,
+			ID:        req.ID,
+			Stderr:    "command exceeds the 32 KiB limit",
+			ExitCode:  -1,
+		})
+		return
+	}
 	s.mu.Lock()
 	controller := s.controller
 	s.mu.Unlock()
 	if controller == "" || msg.From != controller {
-		s.event(fmt.Sprintf("exec from %s dropped: not the controller", msg.From))
+		_ = s.link.SendTo(msg.From, protocol.TypeExecOutput, protocol.ExecOutput{
+			SessionID: s.cfg.SessionID,
+			ID:        req.ID,
+			Stderr:    "not the controller",
+			ExitCode:  -1,
+		})
+		s.event(fmt.Sprintf("exec from %s denied: not the controller", msg.From))
 		return
 	}
 	if strings.TrimSpace(req.Command) == "" {
@@ -950,17 +1114,32 @@ func (s *Session) onExecRequest(msg protocol.Message) {
 			timeout = maxExecTimeout
 		}
 		res := runBounded(s.checkpoints.WorkDir(), req.Command, timeout, protocol.MaxExecOutputBytes)
+		stdout := MaskSecrets(res.stdout)
+		stderr := MaskSecrets(res.stderr)
+		suffix := ""
+		if res.timedOut {
+			suffix = "\n[backseat] command killed after timeout"
+		}
+		// The timeout suffix counts against the output cap, so the total
+		// stays within MaxExecOutputBytes.
+		if budget := int(protocol.MaxExecOutputBytes) - len(suffix); len(stdout)+len(stderr) > budget {
+			over := len(stdout) + len(stderr) - budget
+			if over >= len(stdout) {
+				over -= len(stdout)
+				stdout = ""
+				stderr = stderr[:len(stderr)-over]
+			} else {
+				stdout = stdout[:len(stdout)-over]
+			}
+			res.truncated = true
+		}
 		out := protocol.ExecOutput{
 			SessionID: s.cfg.SessionID,
 			ID:        req.ID,
-			Stdout:    res.stdout,
-			Stderr:    res.stderr,
+			Stdout:    stdout,
+			Stderr:    stderr + suffix,
 			ExitCode:  res.exitCode,
 			Truncated: res.truncated,
-		}
-		if res.timedOut {
-			out.Stderr += "\n[backseat] command killed after timeout"
-			out.Truncated = true
 		}
 		_ = s.link.SendTo(msg.From, protocol.TypeExecOutput, out)
 		cmd := req.Command
