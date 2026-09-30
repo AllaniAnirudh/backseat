@@ -92,6 +92,20 @@ func readEnvelope(t *testing.T, conn *websocket.Conn, timeout time.Duration) pro
 	return msg
 }
 
+// readEnvelopeNoFail is readEnvelope without the Fatalf: it returns nil
+// when nothing arrives in time or the socket is gone, for retry loops.
+func readEnvelopeNoFail(conn *websocket.Conn, timeout time.Duration) *protocol.Message {
+	if err := conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+		return nil
+	}
+	var msg protocol.Message
+	if err := conn.ReadJSON(&msg); err != nil {
+		return nil
+	}
+	_ = conn.SetReadDeadline(time.Time{})
+	return &msg
+}
+
 // readUntil skips envelopes until one of the wanted type arrives.
 func readUntil(t *testing.T, conn *websocket.Conn, timeout time.Duration, want string) protocol.Message {
 	t.Helper()
@@ -137,15 +151,32 @@ func openPayload(t *testing.T, msg protocol.Message, key [32]byte, out any) {
 // enrollExpert joins and completes the HMAC enrollment as a fake expert.
 func enrollExpert(t *testing.T, wsURL, sessionID, name string, secret [32]byte) (*websocket.Conn, pairing.Keys) {
 	t.Helper()
-	conn := dialWS(t, wsURL)
-	sendEnvelope(t, conn, protocol.TypeRoomJoin, name, "", protocol.RoomJoin{
-		SessionID:  sessionID,
-		ExpertName: name,
-	})
-	first := readEnvelope(t, conn, 5*time.Second)
+	// The host's session announce and the expert's join travel on
+	// different relay connections, so under load the join can win the
+	// race and come back no_session (the relay closes the socket on a
+	// rejected join, so each attempt dials fresh). In real use the
+	// announce always precedes the shared invite by human timescales,
+	// so this only bites tests.
+	var conn *websocket.Conn
 	var pe protocol.PairingEnroll
-	if first.Type != protocol.TypePairingEnroll || first.Decode(&pe) != nil || pe.Phase != 1 {
-		t.Fatalf("expected pairing_enroll phase 1, got %s", first.Type)
+	var keys pairing.Keys
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		conn = dialWS(t, wsURL)
+		sendEnvelope(t, conn, protocol.TypeRoomJoin, name, "", protocol.RoomJoin{
+			SessionID:  sessionID,
+			ExpertName: name,
+		})
+		first := readEnvelopeNoFail(conn, 2*time.Second)
+		if first != nil && first.Type == protocol.TypePairingEnroll && first.Decode(&pe) == nil && pe.Phase == 1 {
+			break
+		}
+		conn.Close()
+		conn = nil
+		time.Sleep(100 * time.Millisecond)
+	}
+	if conn == nil {
+		t.Fatalf("expert join never accepted for session %s", sessionID)
 	}
 	chRaw, err := base64.StdEncoding.DecodeString(pe.Challenge)
 	if err != nil || len(chRaw) != pairing.SecretLen {
@@ -154,7 +185,7 @@ func enrollExpert(t *testing.T, wsURL, sessionID, name string, secret [32]byte) 
 	var challenge [pairing.SecretLen]byte
 	copy(challenge[:], chRaw)
 	resp := pairing.EnrollmentResponse(secret, challenge)
-	keys, err := pairing.DeriveKeys(secret, challenge)
+	keys, err = pairing.DeriveKeys(secret, challenge)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -855,7 +886,16 @@ func TestExpertChatTooLong(t *testing.T) {
 
 	conn, keys := enrollExpert(t, wsURL, s.SessionID(), "alice", secret)
 	defer conn.Close()
-	s.Poll() // drain the peer_joined item from enrollment
+	// Drain the peer_joined item from enrollment. pushInbox runs after the
+	// session announce the test already consumed, so wait for it instead
+	// of assuming a single Poll catches it (flaky under -race load).
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if items := s.Poll(); len(items) != 0 {
+			break // drained
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 
 	sendEncrypted(t, conn, keys.ExpertToHost, "alice", protocol.TypeExpertChat, protocol.ExpertChat{
 		SessionID:  s.SessionID(),

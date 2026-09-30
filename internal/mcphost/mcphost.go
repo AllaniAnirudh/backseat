@@ -863,7 +863,7 @@ func (s *Session) promptControlGrant(expert string) {
 	ch := make(chan answer, 1)
 	go func() {
 		yes, err := s.cfg.HumanConfirm(fmt.Sprintf(
-			"Expert '%s' requests control (chat + approvals + shell side-channel). Grant? [y/N]", expert))
+			"Expert '%s' requests control.\nGranting gives them: chat with your agent, answer approval prompts, and run ARBITRARY SHELL COMMANDS AS YOUR USER (full shell access, not sandboxed).\nGrant? [y/N]", expert))
 		ch <- answer{yes: yes, err: err}
 	}()
 	stillPending := func() bool {

@@ -40,10 +40,11 @@ func run(args []string) error {
 	relayWS := fs.String("relay-ws", defaultRelayWS, "relay WebSocket URL")
 	name := fs.String("name", "", "expert display name")
 	secretFlag := fs.String("secret", "", "invite secret (base64url); prompted if the code has none")
-	if err := fs.Parse(args[1:]); err != nil {
+	flagArgs, posArgs := splitFlags(args[1:])
+	if err := fs.Parse(flagArgs); err != nil {
 		return err
 	}
-	rest := fs.Args()
+	rest := append(fs.Args(), posArgs...)
 	if len(rest) != 1 {
 		return errors.New("usage: backseat-tui join <code> [--relay-ws URL] [--name NAME] [--secret SECRET]")
 	}
@@ -141,4 +142,24 @@ func promptSecret(prompt string) (string, error) {
 		return "", err
 	}
 	return string(raw), nil
+}
+
+// splitFlags partitions argv into flag-like args (and their values) and
+// positional args, so `join <code> [--flags]` works the way the usage
+// string reads. All join flags take values: a bare `-flag` consumes the
+// next arg unless it looks like another flag or uses `-flag=value`.
+func splitFlags(argv []string) (flagArgs, posArgs []string) {
+	for i := 0; i < len(argv); i++ {
+		a := argv[i]
+		if strings.HasPrefix(a, "-") && a != "-" {
+			flagArgs = append(flagArgs, a)
+			if !strings.Contains(a, "=") && i+1 < len(argv) && !strings.HasPrefix(argv[i+1], "-") {
+				i++
+				flagArgs = append(flagArgs, argv[i])
+			}
+			continue
+		}
+		posArgs = append(posArgs, a)
+	}
+	return flagArgs, posArgs
 }
