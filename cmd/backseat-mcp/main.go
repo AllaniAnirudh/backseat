@@ -118,6 +118,7 @@ func handleCreateSession(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 	return toolJSON(map[string]any{
 		"session_id":     s.SessionID(),
 		"expert_url":     s.InviteURL(),
+		"expert_code":    s.InviteCode(),
 		"control_socket": sockPath,
 		"label":          req.GetString("label", ""),
 		"note": "Share expert_url with the human expert. Control requests and " +

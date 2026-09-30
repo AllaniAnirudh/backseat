@@ -69,6 +69,11 @@ func ParseSecret(fragment string) ([SecretLen]byte, error) {
 	return s, errors.New("pairing: no secret in fragment")
 }
 
+// EncodeSecret renders a secret as base64url for fragments and short codes.
+func EncodeSecret(secret [SecretLen]byte) string {
+	return base64.RawURLEncoding.EncodeToString(secret[:])
+}
+
 // Verifier returns hex(SHA-256(secret)). The host puts it in the session
 // announcement so the relay can gate room joins without ever seeing the
 // secret itself.

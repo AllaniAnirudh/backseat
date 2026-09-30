@@ -246,10 +246,10 @@ func (s *Session) InviteURL() string {
 	return pairing.InviteURL(s.cfg.UIBase, s.cfg.SessionID, s.cfg.Secret)
 }
 
-// InviteCode is the short code form of the invite secret, for
-// `backseat-tui join <code>`.
+// InviteCode is the short code form for `backseat-tui join <code>`:
+// "<session-id>#<base64url-secret>", matching the TUI's short-code parser.
 func (s *Session) InviteCode() string {
-	return pairing.Verifier(s.cfg.Secret)[:16]
+	return s.cfg.SessionID + "#" + pairing.EncodeSecret(s.cfg.Secret)
 }
 
 // SessionID reports the session id.
@@ -310,8 +310,10 @@ func (s *Session) PublishEvent(kind, text string, fields map[string]any) {
 
 // validDecision checks an expert answer against the prompt's options.
 func validDecision(decision string, options []string) bool {
-	if len(options) == 0 {
-		return decision == DecisionApprove || decision == DecisionDeny
+	// Approve/deny are the card's primary actions and are always valid;
+	// options are extra structured choices beyond the binary decision.
+	if decision == DecisionApprove || decision == DecisionDeny {
+		return true
 	}
 	for _, o := range options {
 		if decision == o {

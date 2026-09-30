@@ -29,9 +29,15 @@ session end is enforced by the Backseat MCP server on this machine.
    Only proceed on an explicit yes.
 3. Call `backseat__create_session` with a short label for the session.
 4. Print the returned share link verbatim and tell the human to send it to
-   their expert (chat, Slack, iMessage, whatever they use).
+   their expert (chat, Slack, iMessage, whatever they use). If the expert
+   prefers a terminal, give them the `expert_code` too: they join with
+   `backseat-tui join <code>`.
 5. Tell the human: the expert can watch only after they join, and any control
-   grant needs a separate explicit confirmation.
+   grant needs a separate explicit confirmation. Grants are confirmed
+   out-of-band with the `backseat-mcp ctl` command printed in the
+   `control_socket` note, e.g.
+   `backseat-mcp ctl --sock /tmp/backseat-mcp-123.sock grant <expert>`.
+   Never confirm a grant yourself; only the human at this machine can.
 6. While the session is active, follow the per-turn rules below.
 
 ## MCP tools (called by this agent)
