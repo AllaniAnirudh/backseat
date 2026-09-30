@@ -181,6 +181,12 @@ func joinUntilAccepted(t *testing.T, wsURL, session, name string) (*websocket.Co
 // enrollExpert dials, joins with no secret, and runs the HMAC enrollment,
 // returning the connection and the derived directional keys.
 func enrollExpert(t *testing.T, wsURL, name string, secret [32]byte) (*websocket.Conn, pairing.Keys) {
+	return enrollExpertHarness(t, wsURL, name, secret, "echo")
+}
+
+// enrollExpertHarness is enrollExpert with the expected harness banner
+// parameterized, for sessions whose host is not the echo harness.
+func enrollExpertHarness(t *testing.T, wsURL, name string, secret [32]byte, harness string) (*websocket.Conn, pairing.Keys) {
 	t.Helper()
 	conn, first := joinUntilAccepted(t, wsURL, sessionID, name)
 	{
@@ -209,7 +215,7 @@ func enrollExpert(t *testing.T, wsURL, name string, secret [32]byte) (*websocket
 		annMsg := readUntil(t, conn, 5*time.Second, protocol.TypeSessionAnnounce)
 		var ann protocol.SessionAnnounce
 		openPayload(t, annMsg, keys.HostToExpert, &ann)
-		if ann.Harness != "echo" {
+		if ann.Harness != harness {
 			t.Fatalf("bad announce: %+v", ann)
 		}
 		return conn, keys

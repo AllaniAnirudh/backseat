@@ -69,28 +69,17 @@ func ParseSecret(fragment string) ([SecretLen]byte, error) {
 	return s, errors.New("pairing: no secret in fragment")
 }
 
-// Verifier returns hex(SHA-256(secret)). The host puts it in the session
-// announcement so the relay can gate room joins without ever seeing the
-// secret itself.
+// EncodeSecret renders a secret as base64url for fragments and short codes.
+func EncodeSecret(secret [SecretLen]byte) string {
+	return base64.RawURLEncoding.EncodeToString(secret[:])
+}
+
+// Verifier returns hex(SHA-256(secret)). The host publishes it with the
+// session announcement so clients can confirm they hold the same invite.
+// The relay does not gate room joins on it.
 func Verifier(secret [SecretLen]byte) string {
 	sum := sha256.Sum256(secret[:])
 	return hex.EncodeToString(sum[:])
-}
-
-// CheckSecret compares a presented base64url secret against a verifier in
-// constant time. Used by the relay to gate room joins.
-func CheckSecret(presentedB64URL, verifier string) bool {
-	raw, err := base64.RawURLEncoding.DecodeString(presentedB64URL)
-	if err != nil || len(raw) != SecretLen {
-		return false
-	}
-	var s [SecretLen]byte
-	copy(s[:], raw)
-	a, b := Verifier(s), verifier
-	if len(a) != len(b) {
-		return false
-	}
-	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
 }
 
 // NewChallenge returns a fresh random challenge for enrollment phase 1.

@@ -127,6 +127,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		log.Printf("relay: websocket upgrade: %v", err)
 		return
 	}
+	// Cap inbound envelope size (1 MiB) on every connection, host and
+	// expert alike: nobody can make the relay buffer unbounded data.
+	conn.SetReadLimit(1 << 20)
 	p := &peer{conn: conn, send: make(chan protocol.Message, 128)}
 	go p.writePump()
 	s.servePeer(p)
