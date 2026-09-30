@@ -6,7 +6,9 @@
 
 **Relay server** (`cmd/backseat-relay`, `internal/relay`). Self-hostable WebSocket relay, untrusted by design. Rooms are keyed by session id; the relay forwards JSON envelopes between host and experts, routing by the plaintext `to`/`from` fields. It admits joins while the invite is fresh, marks newcomers pending until the host confirms their HMAC enrollment, and drops peers that never complete it (60s). It keeps no content keys and tracks no control state: only the host decides whose input reaches the PTY.
 
-**Expert client** (`cmd/backseat-expert`). Web UI served over HTTP. Shows the live terminal via xterm.js, a Request control button, one-tap Approve/Deny cards for forwarded agent approval prompts, and Checkpoint/Rewind buttons (a rewind request needs the novice's confirmation). A transcript pane is still planned. The invite secret stays in the URL fragment, so it never reaches any server in an HTTP request.
+**Expert client** (`cmd/backseat-expert`). Web UI served over HTTP. For PTY sessions it shows the live terminal via xterm.js, a Request control button, one-tap Approve/Deny cards for forwarded agent approval prompts, and Checkpoint/Rewind buttons (a rewind request needs the novice's confirmation). For in-harness sessions (`announce.harness === "mcp"`) it swaps the terminal for a structured transcript pane rendering `transcript_event`, a chat input (`expert_chat`), and a controller-gated exec panel (`exec_request`/`exec_output`); approvals are answered with the structured `approval_decision`. The invite secret stays in the URL fragment, so it never reaches any server in an HTTP request.
+
+**Expert TUI** (`cmd/backseat-tui`). Terminal client for recurring experts: scrollable transcript pane with tool calls inline, keyboard-focusable approval cards with a visible TTL countdown, chat input, controller-gated exec, checkpoint/rewind picker. Same protocol and crypto as the browser client; approval semantics are identical across both.
 
 ## Protocol messages
 
@@ -27,6 +29,10 @@ All messages are JSON over WebSocket inside the `Message` envelope (`type`, `id`
 | `transcript_event` | Parsed harness event from a transcript adapter | `session_id`, `harness`, `kind`, `text`, `fields` |
 | `approval_request` | Agent approval prompt forwarded to the expert | `session_id`, `approval_id`, `tool`, `summary`, `prompt`, `approve_label`, `deny_label`, `expires_at` |
 | `approval_response` | Expert's one-tap decision (or the host's broadcast dismissal) | `session_id`, `approval_id`, `approved`, `responder`, `broadcast` |
+| `expert_chat` | Expert sends a message to the novice agent's inbox (in-harness) | `session_id`, `expert_name`, `text` |
+| `exec_request` | Controller asks the host to run a shell command (in-harness) | `session_id`, `id`, `command`, `timeout_sec` |
+| `exec_output` | Host reports one exec run's result (in-harness) | `session_id`, `id`, `stdout`, `stderr`, `exit_code`, `truncated` |
+| `approval_decision` | Expert's structured approval answer (in-harness) | `session_id`, `approval_id`, `decision`, `decided_by`, `decided_at`, `expires_at` |
 | `checkpoint_create` | Snapshot the working tree before risky work | `session_id`, `label` |
 | `checkpoint_restore` | Request a rewind of the working tree to a checkpoint | `session_id`, `label` |
 | `checkpoint_event` | Checkpoint lifecycle broadcast (`created`, `restored`, `restore_requested`, `restore_denied`, `restore_expired`, `failed`) | `session_id`, `action`, `label`, `message` |
@@ -80,7 +86,7 @@ Raw terminal sharing already exists (tmate). Backseat earns its place with three
 - **Novice kill switch.** Typing `end` in the host terminal (or killing the process) terminates the session, drops all relay attachments, and closes the PTY.
 - **Untrusted relay.** Payloads are end-to-end encrypted with the paired keys (AES-256-GCM, directional keys from HKDF-SHA256). The relay routes opaque envelopes and only ever sees message types, the `to`/`from` routing fields, session ids, and timing.
 - **No forward secrecy yet.** Keys derive from the long-lived invite secret, so a leaked secret decrypts that session's recorded traffic. Each session mints a fresh secret, which bounds the exposure to one session. Ephemeral ECDH for forward secrecy is future work.
-- **Audit log.** The host records every expert action (control grants, inputs while controlling, approval decisions, checkpoint restores) to a local append-only log for later review. Planned for v0.3.
+- **Audit log.** The host records every expert action (control grants, inputs while controlling, approval decisions, checkpoint restores) to a local append-only log for later review. Queued after v0.3.
 - **No private protocol integrations.** Fewer secrets, fewer vendor handshakes, smaller attack surface.
 
 ## v0.3: in-harness MCP server (no PTY)
@@ -89,11 +95,11 @@ For AI coding agents running inside a harness (the `in-harness` branch), there i
 
 **MCP server** (`cmd/backseat-mcp`, `internal/mcphost`). Runs as a stdio MCP server on the novice's machine, one session per process. It exposes exactly seven tools: `backseat__create_session`, `backseat__publish_event`, `backseat__poll`, `backseat__request_approval` (blocking), `backseat__checkpoint`, `backseat__session_status`, `backseat__end_session`. The transport is the shared `internal/link` package (same dial, enrollment, and directional-key code as `internal/host`, refactored so the two hosts cannot drift).
 
-**Control socket** (`backseat-mcp ctl`). There is deliberately no grant tool. Control requests, rewind requests, kick, and end are confirmed by the novice human through `backseat-mcp ctl`, which talks to the session over a unix socket gated by filesystem permissions (same user, never the network). Human confirmation of session creation is enforced by the skill, not the server.
+**Human gates.** Session creation and control grants are confirmed by the novice human on their own terminal: when the agent calls `create_session`, and when an expert requests control, the MCP server prompts the human on `/dev/tty` (which the agent cannot forge) before proceeding. There is deliberately no grant tool. `BACKSEAT_ASSUME_YES=1` skips the prompts for trusted automation. The `backseat-mcp ctl` subcommand remains for kick, end, rewind confirm/deny, and status over a unix socket gated by filesystem permissions (same user, never the network); the socket path is printed to the MCP server's stderr, not returned in the tool result.
 
 **Exec side channel.** The controller can ask the host to run a shell command (`exec_request` / `exec_output`): controller-only, max two concurrent, killed after 2 minutes, combined stdout/stderr truncated to 64 KB, and every run is mirrored into the novice's inbox so the agent sees what the expert ran. There is no PTY here; the novice agent learns about the expert through `poll()` instead of terminal output.
 
-**Trust model differences from the PTY host.** The MCP server is a trusted endpoint running as the novice's own user, same as `backseat-host`. Session creation is human-gated (the skill asks before calling `create_session`). Outbound text is secret-masked (`internal/mcphost/mask.go`: assignment pairs, known token prefixes, bearer tokens, PEM blocks) on a best-effort heuristic basis. Approval prompts from the agent are forwarded to the expert as one-tap cards and resolve fail-closed (timeout, no expert, or session end all mean denied). Expert rewind requests park for novice confirmation with a 60-second fail-closed TTL, same as the PTY host.
+**Trust model differences from the PTY host.** The MCP server is a trusted endpoint running as the novice's own user, same as `backseat-host`. Session creation is human-gated: the server prompts the human on their terminal via `/dev/tty` when `create_session` is called (the skill's own confirmation question stays as informed consent). Outbound text is secret-masked (`internal/mcphost/mask.go`: assignment pairs, known token prefixes, bearer tokens, PEM blocks) on a best-effort heuristic basis. Approval prompts from the agent are forwarded to the expert as one-tap cards and resolve fail-closed (timeout, no expert, or session end all mean denied). Expert rewind requests park for novice confirmation with a 60-second fail-closed TTL, same as the PTY host.
 
 ## MVP demo definition
 
@@ -126,5 +132,5 @@ What actually shipped in v0.1, and where it deliberately diverged from the spec 
 
 - **v0.1** PTY sharing plus control handoff with novice consent (this repo's skeleton).
 - **v0.2** Transcript adapters for claude, copilot, opencode, aider; transcript pane in the expert UI.
-- **v0.3** Transcript adapters, audit log. (Approval forwarding and checkpoints/rewind landed after v0.1.)
+- **v0.3** In-harness MCP server plus expert TUI (this milestone): a no-PTY host (`backseat-mcp`) for agents running inside a harness, the chat/approve/exec protocol additions, the `backseat-tui` expert client, and in-harness mode in the browser expert page. Audit log and ECDH forward secrecy stay queued.
 - **v0.4** NAT traversal and direct transport (WireGuard-style peer link) so the relay becomes optional; hosted relay stays as fallback.

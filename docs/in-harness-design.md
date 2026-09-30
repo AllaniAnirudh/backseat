@@ -24,12 +24,16 @@ gated by the existing single-controller grant model:
    agent calls `backseat__request_approval` (blocking tool call) instead of
    asking the novice.
 3. **Shell side-channel (controller-only).** The expert can run shell commands
-   in the novice's working directory via the relay. Explicitly granted, logged,
-   novice-visible.
+   as the novice's user (unconfined: not limited to the working directory)
+   via the relay. Explicitly granted, logged, novice-visible, and the output
+   is secret-masked.
 
-What control is NOT: the expert never drives the harness UI directly, never
-sees the novice's filesystem beyond the session directory and command output,
-and every grant/deny/yield/kick/end stays enforced by the host side (now the
+What control is NOT: the expert never drives the harness UI directly. Chat
+and approve/deny work with no control grant at all; only the exec
+side-channel is controller-gated. And the exec privilege is real shell, not
+a sandbox: the expert's commands run as the novice's own user, unconfined to
+the session directory, so grants are for trusted experts only. Every
+grant/deny/yield/kick/end stays enforced by the host side (now the
 MCP server), never the relay.
 
 ## Architecture
@@ -99,17 +103,23 @@ plaintext (known v0.2 limit).
 
 ## Trust rules (carried over and extended)
 
-- Session creation is human-gated: human-only skill flags (Claude Code, Cursor,
-  Codex) or human-only command mechanisms (OpenCode, Windsurf) PLUS the skill
-  instructs the agent to get explicit human confirmation before calling
-  `backseat__create_session`. A prompt-injected agent must never mint sessions.
-- Every grant is human-confirmed by the novice, out-of-band of the model's
-  tool calls (same rule as v0.2).
+- Session creation is human-gated: the MCP server prompts the human on their
+  own terminal (`/dev/tty`, which the agent cannot forge) when
+  `backseat__create_session` is called, on top of human-only skill flags
+  (Claude Code, Cursor; Codex support is future, it has no human-only flag
+  yet) and human-only command mechanisms (OpenCode, Windsurf), plus the
+  skill's informed-consent question. `BACKSEAT_ASSUME_YES=1` skips the prompt
+  for trusted automation. A prompt-injected agent must never mint sessions.
+- Every grant is human-confirmed by the novice on their own terminal
+  (`/dev/tty`) when the expert requests control, out-of-band of the model's
+  tool calls (same rule as v0.2). No `ctl grant` needed in the common case.
 - The MCP server is minimal and audited: it bridges to the network, so its
   tool surface is exactly the table above, nothing more.
 - Invite: 10-minute expiry (v0.2), single-use (burn on first enrollment).
-- Expert sees only what the agent publishes plus exec output; secret masking
-  on the publish path.
+- Expert sees only what the agent publishes plus exec output (secret masking
+  on the publish path and on exec output); granting control gives the expert
+  a shell with the novice's user privileges, so grants are for trusted
+  experts only.
 
 ## Per-harness shims (thin by design)
 
@@ -134,8 +144,11 @@ Bubble Tea + Bubbles, same protocol and Go crypto as the browser client:
 - Status bar: connection, WATCHING/DRIVING, presence, relay latency.
 - Join: `backseat-tui join <code>` (short code from the link).
 
-The browser page remains for zero-install guest joins. Approval semantics are
-identical across both clients.
+The browser page remains for zero-install guest joins and now speaks the
+in-harness protocol too: it branches on `announce.harness === "mcp"` into a
+transcript pane, a chat input, approval cards with a visible TTL countdown,
+and a controller-gated exec panel, while PTY sessions keep the terminal UI
+unchanged. Approval semantics are identical across both clients.
 
 ## Out of scope for v0.3
 
