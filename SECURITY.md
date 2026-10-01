@@ -4,13 +4,11 @@
 
 | Version | Supported          |
 | ------- | ------------------ |
-| v0.1.x  | Yes                |
+| v0.3.x  | Yes                |
 
 ## Reporting a vulnerability
 
 Email allanianirudh05@gmail.com with a description of the issue and steps to reproduce it. You will get a reply within 7 days. Do not open a public issue for a suspected vulnerability.
-
-> NOTE FOR THE REPO OWNER: the address above is a placeholder contact. Change it if you want reports to go somewhere else.
 
 ## Scope and honest limitations
 
