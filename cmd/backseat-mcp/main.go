@@ -322,6 +322,10 @@ func runMCPServer() error {
 	srv.AddTool(mcp.NewTool("backseat__create_session",
 		mcp.WithDescription("Create one expert-collaboration session. Asks the human for confirmation first; returns the expert invite URL and code. One session per process."),
 		mcp.WithString("label", mcp.Description("Human-readable label for the session")),
+		mcp.WithReadOnlyHintAnnotation(false),
+		mcp.WithDestructiveHintAnnotation(false),
+		mcp.WithIdempotentHintAnnotation(false),
+		mcp.WithOpenWorldHintAnnotation(true),
 	), handleCreateSession)
 
 	srv.AddTool(mcp.NewTool("backseat__publish_event",
@@ -329,10 +333,18 @@ func runMCPServer() error {
 		mcp.WithString("type", mcp.Required(), mcp.Description("Event type, e.g. progress, blocked, done")),
 		mcp.WithString("text", mcp.Required(), mcp.Description("Human-readable event text")),
 		mcp.WithObject("meta", mcp.Description("Extra string fields attached to the event")),
+		mcp.WithReadOnlyHintAnnotation(false),
+		mcp.WithDestructiveHintAnnotation(false),
+		mcp.WithIdempotentHintAnnotation(false),
+		mcp.WithOpenWorldHintAnnotation(true),
 	), handlePublishEvent)
 
 	srv.AddTool(mcp.NewTool("backseat__poll",
 		mcp.WithDescription("Drain the novice inbox: expert chat, control state changes, exec runs, checkpoint notices. Returns items oldest-first and clears them."),
+		mcp.WithReadOnlyHintAnnotation(false),
+		mcp.WithDestructiveHintAnnotation(false),
+		mcp.WithIdempotentHintAnnotation(false),
+		mcp.WithOpenWorldHintAnnotation(false),
 	), handlePoll)
 
 	srv.AddTool(mcp.NewTool("backseat__request_approval",
@@ -340,20 +352,36 @@ func runMCPServer() error {
 		mcp.WithString("prompt", mcp.Required(), mcp.Description("What the expert is being asked to decide")),
 		mcp.WithArray("options", mcp.Description("Allowed choices shown as one-tap cards"), mcp.WithStringItems()),
 		mcp.WithNumber("timeout", mcp.Description("Seconds to wait before failing closed (default 120, max 120)")),
+		mcp.WithReadOnlyHintAnnotation(false),
+		mcp.WithDestructiveHintAnnotation(false),
+		mcp.WithIdempotentHintAnnotation(false),
+		mcp.WithOpenWorldHintAnnotation(true),
 	), handleRequestApproval)
 
 	srv.AddTool(mcp.NewTool("backseat__checkpoint",
 		mcp.WithDescription("Snapshot the working directory so the expert can rewind to it later."),
 		mcp.WithString("label", mcp.Required(), mcp.Description("Checkpoint label, e.g. before-risky-change")),
+		mcp.WithReadOnlyHintAnnotation(false),
+		mcp.WithDestructiveHintAnnotation(false),
+		mcp.WithIdempotentHintAnnotation(false),
+		mcp.WithOpenWorldHintAnnotation(false),
 	), handleCheckpoint)
 
 	srv.AddTool(mcp.NewTool("backseat__session_status",
 		mcp.WithDescription("Session state: controller, pending requests, enrolled experts, checkpoints, invite state."),
+		mcp.WithReadOnlyHintAnnotation(true),
+		mcp.WithDestructiveHintAnnotation(false),
+		mcp.WithIdempotentHintAnnotation(true),
+		mcp.WithOpenWorldHintAnnotation(false),
 	), handleSessionStatus)
 
 	srv.AddTool(mcp.NewTool("backseat__end_session",
 		mcp.WithDescription("End the session for everyone. The invite is invalidated and enrolled experts are disconnected."),
 		mcp.WithString("reason", mcp.Description("Why the session is ending")),
+		mcp.WithReadOnlyHintAnnotation(false),
+		mcp.WithDestructiveHintAnnotation(true),
+		mcp.WithIdempotentHintAnnotation(true),
+		mcp.WithOpenWorldHintAnnotation(true),
 	), handleEndSession)
 
 	return server.ServeStdio(srv)
