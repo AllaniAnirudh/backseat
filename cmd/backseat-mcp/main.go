@@ -311,12 +311,9 @@ func handleEndSession(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallTo
 	return toolJSON(map[string]any{"ended": true})
 }
 
-func runMCPServer() error {
-	if os.Getenv("BACKSEAT_ASSUME_YES") == "1" {
-		fmt.Fprintln(os.Stderr, "backseat: WARNING: BACKSEAT_ASSUME_YES=1 is set: human confirmation prompts are DISABLED. "+
-			"Only set this for trusted automation or tests; never in a config the agent can write, "+
-			"or a prompt-injected agent could create sessions and approve grants on its own.")
-	}
+// buildMCPServer registers all seven backseat tools with their annotations.
+// Kept separate from runMCPServer so tests can inspect the tool list.
+func buildMCPServer() *server.MCPServer {
 	srv := server.NewMCPServer("backseat", "0.3.0")
 
 	srv.AddTool(mcp.NewTool("backseat__create_session",
@@ -384,7 +381,16 @@ func runMCPServer() error {
 		mcp.WithOpenWorldHintAnnotation(true),
 	), handleEndSession)
 
-	return server.ServeStdio(srv)
+	return srv
+}
+
+func runMCPServer() error {
+	if os.Getenv("BACKSEAT_ASSUME_YES") == "1" {
+		fmt.Fprintln(os.Stderr, "backseat: WARNING: BACKSEAT_ASSUME_YES=1 is set: human confirmation prompts are DISABLED. "+
+			"Only set this for trusted automation or tests; never in a config the agent can write, "+
+			"or a prompt-injected agent could create sessions and approve grants on its own.")
+	}
+	return server.ServeStdio(buildMCPServer())
 }
 
 // runCtl speaks to a running session's control socket: the novice human's
