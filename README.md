@@ -2,6 +2,8 @@
 
 ![status](https://img.shields.io/badge/status-early%20MVP-orange)
 
+[![M8ven Verified](https://m8ven.ai/badge/mcp/allanianirudh-backseat-1s9sux?variant=verified)](https://m8ven.ai/mcp/allanianirudh-backseat-1s9sux?s=readme)
+
 ![Expert driving a session in the browser](docs/images/expert-driving.png)
 
 *Verified with a real headless-Chromium click-through: join as viewer, request control, host grants, typed input echoed back through the PTY, yield. Zero JS errors.*
